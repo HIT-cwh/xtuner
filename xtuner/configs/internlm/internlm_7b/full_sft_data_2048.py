@@ -22,8 +22,8 @@ import torch
 pretrained_model_name_or_path = '/mnt/petrelfs/share_data/internlm-7b'
 
 # Data
-dataset_folder = '/mnt/hwfile/caoweihan/projects/train/cn'  # yudong sft data
-cached_folder = '/mnt/hwfile/caoweihan/projects/xtuner/yudong/packed_processed_dataset'
+dataset_folder = '/mnt/hwfile/share_data/caoweihan/v027rc8_release/cn'  # yudong sft data
+cached_folder = '/mnt/hwfile/caoweihan/projects/xtuner/yudong/packed_processed_dataset_new'
 prompt_template = PROMPT_TEMPLATE.internlm_chat
 max_length = 2048
 pack_to_max_length = True
@@ -72,7 +72,7 @@ train_dataset = dict(
     cached_folder=cached_folder,
     max_length=max_length,
     pack_to_max_length=pack_to_max_length,
-    num_proc=96)
+    num_proc=32)
 
 train_dataloader = dict(
     batch_size=batch_size,
