@@ -27,7 +27,7 @@ pretrained_model_name_or_path = 'baichuan-inc/Baichuan2-7B-Base'
 # Data
 alpaca_zh_path = 'silk-road/alpaca-data-gpt4-chinese'
 alpaca_en_path = 'tatsu-lab/alpaca'
-prompt_template = PROMPT_TEMPLATE.baichuan2_chat
+prompt_template = PROMPT_TEMPLATE.default
 max_length = 2048
 pack_to_max_length = True
 
@@ -110,9 +110,7 @@ alpaca_zh = dict(
     shuffle_before_pack=True,
     pack_to_max_length=pack_to_max_length)
 
-train_dataset = dict(
-    type=ConcatDataset,
-    datasets_cfg=dict(alpaca_en=alpaca_en, alpaca_zh=alpaca_zh))
+train_dataset = dict(type=ConcatDataset, datasets=[alpaca_en, alpaca_zh])
 
 train_dataloader = dict(
     batch_size=batch_size,

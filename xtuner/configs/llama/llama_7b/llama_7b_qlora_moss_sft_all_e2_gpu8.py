@@ -99,10 +99,7 @@ moss_sft_plugins = dict(
     max_length=max_length)
 
 train_dataset = dict(
-    type=ConcatDataset,
-    datasets_cfg=dict(
-        moss_sft_no_plugins=moss_sft_no_plugins,
-        moss_sft_plugins=moss_sft_plugins))
+    type=ConcatDataset, datasets=[moss_sft_no_plugins, moss_sft_plugins])
 
 train_dataloader = dict(
     batch_size=batch_size,
@@ -156,7 +153,7 @@ custom_hooks = [
         type=EvaluateChatHook,
         tokenizer=tokenizer,
         every_n_iters=evaluation_freq,
-        stop_word='<eoc>',
+        stop_words=['<eoc>'],
         evaluation_inputs=evaluation_inputs,
         system=SYSTEM,
         prompt_template=prompt_template)

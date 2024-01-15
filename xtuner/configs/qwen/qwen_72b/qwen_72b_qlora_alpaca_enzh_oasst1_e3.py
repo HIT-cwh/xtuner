@@ -28,7 +28,7 @@ pretrained_model_name_or_path = 'Qwen/Qwen-72B'
 alpaca_zh_path = 'silk-road/alpaca-data-gpt4-chinese'
 alpaca_en_path = 'tatsu-lab/alpaca'
 oasst1_path = 'timdettmers/openassistant-guanaco'
-prompt_template = PROMPT_TEMPLATE.qwen_chat
+prompt_template = PROMPT_TEMPLATE.default
 max_length = 2048
 pack_to_max_length = True
 
@@ -125,8 +125,7 @@ oasst1 = dict(
     pack_to_max_length=pack_to_max_length)
 
 train_dataset = dict(
-    type=ConcatDataset,
-    datasets_cfg=dict(alpaca_en=alpaca_en, alpaca_zh=alpaca_zh, oasst1=oasst1))
+    type=ConcatDataset, datasets=[alpaca_en, alpaca_zh, oasst1])
 
 train_dataloader = dict(
     batch_size=batch_size,
@@ -180,7 +179,6 @@ custom_hooks = [
         type=EvaluateChatHook,
         tokenizer=tokenizer,
         every_n_iters=evaluation_freq,
-        stop_word='<|endoftext|>',
         evaluation_inputs=evaluation_inputs,
         system=SYSTEM,
         prompt_template=prompt_template)

@@ -1,31 +1,28 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-import torch
-from bitsandbytes.optim import PagedAdamW32bit
 from datasets import load_dataset
 from mmengine.dataset import DefaultSampler
 from mmengine.hooks import (CheckpointHook, DistSamplerSeedHook, IterTimerHook,
                             LoggerHook, ParamSchedulerHook)
 from mmengine.optim import AmpOptimWrapper, CosineAnnealingLR, LinearLR
-from peft import LoraConfig
-from transformers import (AutoModelForCausalLM, AutoTokenizer,
-                          BitsAndBytesConfig)
+from torch.optim import AdamW
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from xtuner.dataset import process_hf_dataset
 from xtuner.dataset.collate_fns import default_collate_fn
-from xtuner.dataset.map_fns import code_alpaca_map_fn, template_map_fn_factory
+from xtuner.dataset.map_fns import oasst1_map_fn, template_map_fn_factory
 from xtuner.engine import DatasetInfoHook, EvaluateChatHook
 from xtuner.model import SupervisedFinetune
-from xtuner.utils import PROMPT_TEMPLATE, SYSTEM_TEMPLATE
+from xtuner.utils import PROMPT_TEMPLATE
 
 #######################################################################
 #                          PART 1  Settings                           #
 #######################################################################
 # Model
-pretrained_model_name_or_path = 'deepseek-ai/deepseek-coder-6.7b-instruct'
+pretrained_model_name_or_path = 'deepseek-ai/deepseek-moe-16b-chat'
 
 # Data
-data_path = 'HuggingFaceH4/CodeAlpaca_20K'
-prompt_template = PROMPT_TEMPLATE.deepseekcoder
+data_path = 'timdettmers/openassistant-guanaco'
+prompt_template = PROMPT_TEMPLATE.deepseek_moe
 max_length = 2048
 pack_to_max_length = True
 
@@ -34,22 +31,18 @@ batch_size = 1  # per_device
 accumulative_counts = 16
 dataloader_num_workers = 0
 max_epochs = 3
-optim_type = PagedAdamW32bit
-lr = 2e-4
+optim_type = AdamW
+lr = 2e-5
 betas = (0.9, 0.999)
 weight_decay = 0
 max_norm = 1  # grad clip
 warmup_ratio = 0.03
 
 # Evaluate the generation performance during the training
-evaluation_freq = 100
-SYSTEM = SYSTEM_TEMPLATE.coder
+evaluation_freq = 500
+SYSTEM = ''
 evaluation_inputs = [
-    ('写一个Python函数，将十六进制颜色代码（如#0066ee）转换为对应的'
-     '红、绿、蓝（RGB）三个颜色分量值，并以元组的形式返回。'),
-    ('Write a Python function that takes a hexadecimal color code '
-     '(e.g., #0066ee) as input and converts it into the corresponding '
-     'red, green, and blue (RGB) color component values.')
+    '请给我介绍五个上海的景点', 'Please tell me five scenic spots in Shanghai'
 ]
 
 #######################################################################
@@ -59,32 +52,14 @@ tokenizer = dict(
     type=AutoTokenizer.from_pretrained,
     pretrained_model_name_or_path=pretrained_model_name_or_path,
     trust_remote_code=True,
-    padding_side='right',
-    eos_token='<|EOT|>')
+    padding_side='right')
 
 model = dict(
     type=SupervisedFinetune,
     llm=dict(
         type=AutoModelForCausalLM.from_pretrained,
         pretrained_model_name_or_path=pretrained_model_name_or_path,
-        trust_remote_code=True,
-        torch_dtype=torch.float16,
-        quantization_config=dict(
-            type=BitsAndBytesConfig,
-            load_in_4bit=True,
-            load_in_8bit=False,
-            llm_int8_threshold=6.0,
-            llm_int8_has_fp16_weight=False,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type='nf4')),
-    lora=dict(
-        type=LoraConfig,
-        r=64,
-        lora_alpha=16,
-        lora_dropout=0.1,
-        bias='none',
-        task_type='CAUSAL_LM'))
+        trust_remote_code=True))
 
 #######################################################################
 #                      PART 3  Dataset & Dataloader                   #
@@ -94,7 +69,7 @@ train_dataset = dict(
     dataset=dict(type=load_dataset, path=data_path),
     tokenizer=tokenizer,
     max_length=max_length,
-    dataset_map_fn=code_alpaca_map_fn,
+    dataset_map_fn=oasst1_map_fn,
     template_map_fn=dict(
         type=template_map_fn_factory, template=prompt_template),
     remove_unused_columns=True,
@@ -153,7 +128,6 @@ custom_hooks = [
         type=EvaluateChatHook,
         tokenizer=tokenizer,
         every_n_iters=evaluation_freq,
-        stop_word='<|EOT|>',
         evaluation_inputs=evaluation_inputs,
         system=SYSTEM,
         prompt_template=prompt_template)
