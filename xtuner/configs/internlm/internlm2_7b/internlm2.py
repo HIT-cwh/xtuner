@@ -13,7 +13,6 @@ from xtuner.engine import (DatasetInfoHook, EvaluateChatHook,
                            LocalAttnArgsToMessageHubHook, ThroughputHook)
 from xtuner.model import SupervisedFinetune
 from xtuner.utils import PROMPT_TEMPLATE
-from xtuner.engine.runner.loops import EpochBasedTrainLoop
 
 #######################################################################
 #                          PART 1  Settings                           #
@@ -23,14 +22,14 @@ pretrained_model_name_or_path = '/mnt/petrelfs/share_data/caoweihan/official_Amp
 use_local_attn = True
 
 # Data
-dataset_folder = '/mnt/petrelfs/share_data/zhangwenwei/data/llm/delivery_ft-0.17/v0.17.0rc8_32k/training/chatml_llamav13_32k/train'  # noqa: E501
+dataset_folder = '/mnt/petrelfs/share_data/caoweihan/chatml_llamav13_32k/train'  # noqa: E501
 prompt_template = PROMPT_TEMPLATE.internlm2_chat
 max_length = 32768
 pack_to_max_length = True
 
 # Scheduler & Optimizer
 batch_size = 1  # per_device
-accumulative_counts = 2  # 1bs * 1acc * 64gpu = 64 batchsize
+accumulative_counts = 1  # 1bs * 1acc * 64gpu = 64 batchsize
 dataloader_num_workers = 4
 max_epochs = 1
 optim_type = AdamW
@@ -38,7 +37,6 @@ lr = 4e-5
 betas = (0.9, 0.95)
 weight_decay = 0.01
 max_norm = 1  # grad clip
-total_iters = 3749
 warm_up_ratio = 0.025
 
 # Evaluate the generation performance during the training

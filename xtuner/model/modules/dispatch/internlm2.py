@@ -159,8 +159,10 @@ def internlm2_attn_forward(
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
     # use flash attention implemented by pytorch
-    attn_output = F.scaled_dot_product_attention(
-        query_states, key_states, value_states, attn_mask=attention_mask)
+    # attn_output = F.scaled_dot_product_attention(
+    #     query_states, key_states, value_states, attn_mask=attention_mask)
+    attn_output = flash_attn_func(
+            query_states, key_states, value_states, causal=True)
 
     attn_output = attn_output.transpose(1, 2).contiguous()
     attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)

@@ -14,7 +14,6 @@ from xtuner.engine import (DatasetInfoHook, EvaluateChatHook,
 from xtuner.engine.hooks.empty_cache_hook import EmptyCacheHook
 from xtuner.model import SupervisedFinetune
 from xtuner.utils import PROMPT_TEMPLATE
-from xtuner.engine.runner.loops import EpochBasedTrainLoop
 
 #######################################################################
 #                          PART 1  Settings                           #
@@ -31,7 +30,7 @@ pack_to_max_length = True
 
 # Scheduler & Optimizer
 batch_size = 1  # per_device
-accumulative_counts = 2  # 1bs * 1acc * 64gpu = 64 batchsize
+accumulative_counts = 1  # 1bs * 1acc * 64gpu = 64 batchsize
 dataloader_num_workers = 4
 max_epochs = 1
 optim_type = AdamW
