@@ -3,7 +3,10 @@ from typing import Iterator, Optional, Sized
 import numpy as np
 from mmengine.dist import get_dist_info, sync_random_seed
 from torch.utils.data import Sampler
+import torch.distributed as dist
 
+
+from xtuner.engine._strategy.deepspeed import get_sequence_parallel_world_size, get_sequence_parallel_rank, get_data_parallel_rank, get_data_parallel_world_size
 
 class InternlmRepoSampler(Sampler):
 
@@ -11,9 +14,12 @@ class InternlmRepoSampler(Sampler):
                  dataset: Sized,
                  shuffle: bool = True,
                  seed: Optional[int] = None) -> None:
-        rank, world_size = get_dist_info()
+        # rank, world_size = get_dist_info()
+        # rank = get_sequence_parallel_rank()
+        dp_world_size = get_data_parallel_world_size()
+        rank = get_data_parallel_rank()
         self.rank = rank
-        self.world_size = world_size
+        self.dp_world_size = dp_world_size
 
         self.dataset = dataset
         self.shuffle = shuffle
@@ -22,8 +28,8 @@ class InternlmRepoSampler(Sampler):
         self.seed = seed
         self.epoch = 0
 
-        self.num_samples = len(self.dataset) // world_size
-        self.total_size = self.num_samples * world_size
+        self.num_samples = len(self.dataset) // dp_world_size
+        self.total_size = self.num_samples * dp_world_size
 
     def __iter__(self) -> Iterator[int]:
         """Iterate the indices."""
@@ -39,7 +45,7 @@ class InternlmRepoSampler(Sampler):
         self.indices = indices[:self.total_size]
 
         # subsample
-        indices = indices[self.rank:self.total_size:self.world_size]
+        indices = indices[self.rank:self.total_size:self.dp_world_size]
         self.subsample_indices = indices
 
         return iter(indices)

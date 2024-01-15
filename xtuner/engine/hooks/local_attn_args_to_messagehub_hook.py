@@ -36,7 +36,7 @@ class LocalAttnArgsToMessageHubHook(Hook):
         data = data_batch['data']
 
         for arg in self.args:
-            assert arg in data
+            assert arg in data, arg
             message_hub.update_info(f'{arg}_rank_{rank}',
                                     self.cast_data(data.pop(arg)))
 

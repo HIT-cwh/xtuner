@@ -133,7 +133,7 @@ def replace_internlm_rote(model):
 def replace_internlm2_rote(model):
     from .internlm2 import InternLM2RotaryEmbedding
 
-    rotary_base = model.config.rotary['base']
+    # rotary_base = model.config.rotary['base']
     # fixme
     rotary_base = 1000000
 

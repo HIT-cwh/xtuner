@@ -55,6 +55,7 @@ def parse_args():
         choices=['none', 'pytorch', 'slurm', 'mpi'],
         default='none',
         help='job launcher')
+    parser.add_argument('--sp', type=int, default=1)
     parser.add_argument('--local_rank', '--local-rank', type=int, default=0)
     args = parser.parse_args()
     return args
@@ -247,7 +248,7 @@ def main():
                     gradient_accumulation_steps=grad_accum,
                     train_micro_batch_size_per_gpu=train_bs,
                     gradient_clipping=grad_clip,
-                    exclude_frozen_parameters=exclude_frozen_parameters)
+                    exclude_frozen_parameters=exclude_frozen_parameters, sp_size=args.sp)
                 cfg.__setitem__('strategy', strategy)
                 optim_wrapper = dict(
                     type='DeepSpeedOptimWrapper',

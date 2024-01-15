@@ -12,6 +12,8 @@ from .modules import dispatch_modules
 from .utils import (LoadWoInit, find_all_linear_names,
                     get_peft_model_state_dict, make_inputs_require_grad,
                     traverse_dict)
+from xtuner.engine._strategy.deepspeed import get_sequence_parallel_group
+import torch.distributed as dist
 
 
 class SupervisedFinetune(BaseModel):
@@ -129,8 +131,16 @@ class SupervisedFinetune(BaseModel):
         return logits_dict
 
     def compute_loss(self, data, data_samples=None):
+
         outputs = self.llm(**data)
-        loss_dict = {'loss': outputs.loss}
+        labels = data['labels']
+        num_tokens = (labels != -100).sum()
+        sequence_parallel_group = get_sequence_parallel_group()
+        loss = outputs.loss * num_tokens
+        dist.all_reduce(loss, group=sequence_parallel_group)
+        dist.all_reduce(num_tokens, group=sequence_parallel_group)
+        loss = loss / num_tokens
+        loss_dict = {'loss': loss}
         return loss_dict
 
     def state_dict(self, *args, **kwargs):
