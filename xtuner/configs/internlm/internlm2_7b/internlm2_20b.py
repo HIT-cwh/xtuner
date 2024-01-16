@@ -23,7 +23,7 @@ pretrained_model_name_or_path = '/mnt/petrelfs/share_data/caoweihan/official_Gau
 use_local_attn = True
 
 # Data
-dataset_folder = '/mnt/petrelfs/share_data/liukuikun/datasets/v0.19.0rc14/training/chatml_llamav13_32k/train'  # noqa: E501
+dataset_folder = '/mnt/petrelfs/share_data/caoweihan/chatml_llamav13_32k/train'  # noqa: E501
 prompt_template = PROMPT_TEMPLATE.internlm2_chat
 max_length = 32768
 pack_to_max_length = True
@@ -125,16 +125,16 @@ train_cfg = dict(by_epoch=True, max_epochs=max_epochs, val_interval=1)
 #######################################################################
 # Log the dialogue periodically during the training process, optional
 custom_hooks = [
-    dict(
-        type=DatasetInfoHook, tokenizer=tokenizer,
-        is_intern_repo_dataset=True),
-    dict(
-        type=EvaluateChatHook,
-        tokenizer=tokenizer,
-        every_n_iters=evaluation_freq,
-        evaluation_inputs=evaluation_inputs,
-        system=SYSTEM,
-        prompt_template=prompt_template),
+    # dict(
+    #     type=DatasetInfoHook, tokenizer=tokenizer,
+    #     is_intern_repo_dataset=True),
+    # dict(
+    #     type=EvaluateChatHook,
+    #     tokenizer=tokenizer,
+    #     every_n_iters=evaluation_freq,
+    #     evaluation_inputs=evaluation_inputs,
+    #     system=SYSTEM,
+    #     prompt_template=prompt_template),
     dict(type=ThroughputHook),
     dict(type=LocalAttnArgsToMessageHubHook, ),
     # dict(type=EmptyCacheHook)
