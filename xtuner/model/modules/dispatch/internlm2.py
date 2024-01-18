@@ -162,7 +162,7 @@ def internlm2_attn_forward(
     # attn_output = F.scaled_dot_product_attention(
     #     query_states, key_states, value_states, attn_mask=attention_mask)
     attn_output = flash_attn_func(
-            query_states, key_states, value_states, causal=True)
+        query_states, key_states, value_states, causal=True)
 
     attn_output = attn_output.transpose(1, 2).contiguous()
     attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
@@ -175,11 +175,11 @@ def internlm2_attn_forward(
     return attn_output, None, past_key_value
 
 
-from torch import Tensor
-from torch.nn import Module
+from typing import Any, Tuple
 
 import deepspeed.comm as dist
-from typing import Any, Tuple
+from torch import Tensor
+from torch.nn import Module
 
 
 def single_all_to_all(input, scatter_idx, gather_idx, group):
@@ -214,7 +214,8 @@ def single_all_to_all(input, scatter_idx, gather_idx, group):
 class _SeqAllToAll(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx: Any, group: dist.ProcessGroup, input: Tensor, scatter_idx: int, gather_idx: int) -> Tensor:
+    def forward(ctx: Any, group: dist.ProcessGroup, input: Tensor,
+                scatter_idx: int, gather_idx: int) -> Tensor:
 
         ctx.group = group
         ctx.scatter_idx = scatter_idx
@@ -223,24 +224,36 @@ class _SeqAllToAll(torch.autograd.Function):
         return single_all_to_all(input, scatter_idx, gather_idx, group)
 
     @staticmethod
-    def backward(ctx: Any, *grad_output: Tensor) -> Tuple[None, Tensor, None, None]:
-        return (None, _SeqAllToAll.apply(ctx.group, *grad_output, ctx.gather_idx, ctx.scatter_idx), None, None)
+    def backward(ctx: Any,
+                 *grad_output: Tensor) -> Tuple[None, Tensor, None, None]:
+        return (None,
+                _SeqAllToAll.apply(ctx.group, *grad_output, ctx.gather_idx,
+                                   ctx.scatter_idx), None, None)
+
 
 scatter_idx = 2
 gather_idx = 0
 
-from xtuner.engine._strategy.deepspeed import get_sequence_parallel_group, get_sequence_parallel_world_size
-def dist_attn(query_states, key_states, value_states, cumulative_len, max_seqlen):
-    # b, s, nd, dim
-    sequence_process_world_size = get_sequence_parallel_world_size()
-    if sequence_process_world_size > 1:
-        sequence_process_group = get_sequence_parallel_group()
-        query_states = _SeqAllToAll.apply(sequence_process_group, query_states, scatter_idx, gather_idx)
-        key_states = _SeqAllToAll.apply(sequence_process_group, key_states, scatter_idx, gather_idx)
-        value_states = _SeqAllToAll.apply(sequence_process_group, value_states, scatter_idx, gather_idx)
+from xtuner.engine._strategy.deepspeed import (get_sequence_parallel_group,
+                                               get_sequence_parallel_world_size
+                                               )
 
-    q_unpad, k_unpad, v_unpad = query_states.flatten(
-        0, 1), key_states.flatten(0, 1), value_states.flatten(0, 1)
+
+def dist_attn(query_states, key_states, value_states, cumulative_len,
+              max_seqlen):
+    # b, s, nd, dim
+    # sequence_process_world_size = get_sequence_parallel_world_size()
+    # if sequence_process_world_size > 1:
+    sequence_process_group = get_sequence_parallel_group()
+    query_states = _SeqAllToAll.apply(sequence_process_group, query_states,
+                                      scatter_idx, gather_idx)
+    key_states = _SeqAllToAll.apply(sequence_process_group, key_states,
+                                    scatter_idx, gather_idx)
+    value_states = _SeqAllToAll.apply(sequence_process_group, value_states,
+                                      scatter_idx, gather_idx)
+
+    q_unpad, k_unpad, v_unpad = query_states.flatten(0, 1), key_states.flatten(
+        0, 1), value_states.flatten(0, 1)
     cumulative_len = torch.cat(cumulative_len, dim=0)
     attn_output = flash_attn_varlen_func(
         q_unpad,
@@ -254,12 +267,13 @@ def dist_attn(query_states, key_states, value_states, cumulative_len, max_seqlen
         return_attn_probs=False,
         causal=True,
     )
-    if sequence_process_world_size > 1:
-        attn_output = attn_output.unsqueeze(1)
+    # if sequence_process_world_size > 1:
+    attn_output = attn_output.unsqueeze(1)
 
-        output = _SeqAllToAll.apply(sequence_process_group, attn_output, gather_idx, scatter_idx)
-    else:
-        output = attn_output
+    output = _SeqAllToAll.apply(sequence_process_group, attn_output,
+                                gather_idx, scatter_idx)
+    # else:
+    #     output = attn_output
     return output
 
 
@@ -332,7 +346,8 @@ def internlm2_local_attn_forward(
 
     assert SUPPORT_FLASH2
     if is_training:
-        attn_output = dist_attn(query_states, key_states, value_states, cumulative_len, max_seqlen)
+        attn_output = dist_attn(query_states, key_states, value_states,
+                                cumulative_len, max_seqlen)
         # q_unpad, k_unpad, v_unpad = query_states.flatten(
         #     0, 1), key_states.flatten(0, 1), value_states.flatten(0, 1)
         # cumulative_len = torch.cat(cumulative_len, dim=0)
