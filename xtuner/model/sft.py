@@ -1,12 +1,14 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from collections import OrderedDict
 
+import torch.distributed as dist
 from mmengine.config import Config, ConfigDict
 from mmengine.model import BaseModel
 from mmengine.runner import load_checkpoint
 from peft import get_peft_model, prepare_model_for_kbit_training
 from torch import nn
 
+from xtuner.engine._strategy.deepspeed import get_sequence_parallel_group
 from xtuner.registry import BUILDER
 from .modules import dispatch_modules
 from .utils import (LoadWoInit, find_all_linear_names,
@@ -116,7 +118,17 @@ class SupervisedFinetune(BaseModel):
 
     def compute_loss(self, data, data_samples=None):
         outputs = self.llm(**data)
-        loss_dict = {'loss': outputs.loss}
+        labels = data['labels']
+        num_tokens = (labels != -100).sum()
+        sequence_parallel_group = get_sequence_parallel_group()
+        with open('debug.txt', 'a+') as f:
+            f.write(f'{num_tokens}, {dist.get_rank()} \n')
+        loss = outputs.loss * num_tokens
+        dist.all_reduce(loss, group=sequence_parallel_group)
+        dist.all_reduce(num_tokens, group=sequence_parallel_group)
+        loss = loss / num_tokens
+        loss_dict = {'loss': loss}
+        # loss_dict = {'loss': outputs.loss}
         return loss_dict
 
     def state_dict(self, *args, **kwargs):

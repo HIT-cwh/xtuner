@@ -4,6 +4,9 @@ from typing import Dict, Sequence
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
+from xtuner.engine._strategy.deepspeed import (get_sequence_parallel_rank,
+                                               get_sequence_parallel_world_size
+                                               )
 from xtuner.utils import DEFAULT_PAD_TOKEN_INDEX, IGNORE_INDEX
 
 
@@ -11,6 +14,9 @@ def default_collate_fn(instances: Sequence[Dict],
                        pad_index: int = DEFAULT_PAD_TOKEN_INDEX,
                        return_hf_format: bool = False,
                        use_varlen_attn: bool = False):
+
+    seq_parallel_world_size = get_sequence_parallel_world_size()
+    seq_parallel_world_rank = get_sequence_parallel_rank()
 
     input_ids, labels = [], []
     has_image = any(inst.get('pixel_values') is not None for inst in instances)
@@ -26,11 +32,22 @@ def default_collate_fn(instances: Sequence[Dict],
         pixel_values = []
 
     for example in instances:
-        input_ids.append(torch.LongTensor(example['input_ids']))
-        labels.append(torch.LongTensor(example['labels']))
+
+        seq_length = len(example['input_ids'])
+        assert seq_length % seq_parallel_world_size == 0
+        sub_seq_length = seq_length // seq_parallel_world_size
+        sub_seq_start = seq_parallel_world_rank * sub_seq_length
+        sub_seq_end = (seq_parallel_world_rank + 1) * sub_seq_length
+
+        input_ids.append(
+            torch.LongTensor(example['input_ids'][sub_seq_start:sub_seq_end]))
+        labels.append(
+            torch.LongTensor(example['labels'][sub_seq_start:sub_seq_end]))
         if use_varlen_attn:
             cumulative_len.append(torch.IntTensor(example['cumulative_len']))
-            indexes.append(torch.LongTensor(example['indexes']))
+            indexes.append(
+                torch.LongTensor(
+                    example['indexes'][sub_seq_start:sub_seq_end]))
 
         if has_image:
             pixel_values.append(example['pixel_values'])

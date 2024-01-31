@@ -173,6 +173,108 @@ def internlm2_attn_forward(
     return attn_output, None, past_key_value
 
 
+from typing import Any, Tuple
+
+import deepspeed.comm as dist
+from torch import Tensor
+from torch.nn import Module
+
+
+def single_all_to_all(input, scatter_idx, gather_idx, group):
+    seq_world_size = dist.get_world_size(group)
+    inp_shape = list(input.shape)
+    inp_shape[scatter_idx] = inp_shape[scatter_idx] // seq_world_size
+    if scatter_idx < 2:
+        input_t = input.reshape(
+            [seq_world_size, inp_shape[scatter_idx]] + \
+            inp_shape[scatter_idx + 1:]
+        ).contiguous()
+    else:
+        # transpose groups of heads with the seq-len parallel dimension, so that we can scatter them!
+        input_t = input.reshape(
+            [-1, seq_world_size, inp_shape[scatter_idx]] + \
+            inp_shape[scatter_idx + 1:]
+        ).transpose(0, 1).contiguous()  # (2, 16k, 16, 128)
+
+    output = torch.empty_like(input_t)
+    dist.all_to_all_single(output, input_t, group=group)
+
+    # if scattering the seq-dim, transpose the heads back to the original dimension
+    if scatter_idx < 2:
+        output = output.transpose(0, 1).contiguous()
+
+    return output.reshape(
+        inp_shape[: gather_idx] + \
+        [inp_shape[gather_idx] * seq_world_size,] + \
+        inp_shape[gather_idx + 1:]).contiguous()  # (2, 16k, 16, 128)
+
+
+class _SeqAllToAll(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx: Any, group: dist.ProcessGroup, input: Tensor,
+                scatter_idx: int, gather_idx: int) -> Tensor:
+
+        ctx.group = group
+        ctx.scatter_idx = scatter_idx
+        ctx.gather_idx = gather_idx
+
+        return single_all_to_all(input, scatter_idx, gather_idx, group)
+
+    @staticmethod
+    def backward(ctx: Any,
+                 *grad_output: Tensor) -> Tuple[None, Tensor, None, None]:
+        return (None,
+                _SeqAllToAll.apply(ctx.group, *grad_output, ctx.gather_idx,
+                                   ctx.scatter_idx), None, None)
+
+
+scatter_idx = 2
+gather_idx = 0
+
+from xtuner.engine._strategy.deepspeed import (get_sequence_parallel_group,
+                                               get_sequence_parallel_world_size
+                                               )
+
+
+def dist_attn(query_states, key_states, value_states, cumulative_len,
+              max_seqlen):
+    # b, s, nd, dim
+    sequence_process_world_size = get_sequence_parallel_world_size()
+    # if sequence_process_world_size > 1:
+    sequence_process_group = get_sequence_parallel_group()
+    query_states = _SeqAllToAll.apply(sequence_process_group, query_states,
+                                      scatter_idx, gather_idx)
+    key_states = _SeqAllToAll.apply(sequence_process_group, key_states,
+                                    scatter_idx, gather_idx)
+    value_states = _SeqAllToAll.apply(sequence_process_group, value_states,
+                                      scatter_idx, gather_idx)
+
+    q_unpad, k_unpad, v_unpad = query_states.flatten(0, 1), key_states.flatten(
+        0, 1), value_states.flatten(0, 1)
+    cumulative_len = torch.cat(cumulative_len, dim=0)
+    attn_output = flash_attn_varlen_func(
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cumulative_len,
+        cumulative_len,
+        max_seqlen,
+        max_seqlen,
+        0,
+        return_attn_probs=False,
+        causal=True,
+    )
+    # if sequence_process_world_size > 1:
+    attn_output = attn_output.unsqueeze(1)
+
+    output = _SeqAllToAll.apply(sequence_process_group, attn_output,
+                                gather_idx, scatter_idx)
+    # else:
+    #     output = attn_output
+    return output
+
+
 def internlm2_varlen_attn_forward(
     self,
     hidden_states: torch.Tensor,
@@ -242,21 +344,23 @@ def internlm2_varlen_attn_forward(
 
     assert SUPPORT_FLASH2
     if is_training:
-        q_unpad, k_unpad, v_unpad = query_states.flatten(
-            0, 1), key_states.flatten(0, 1), value_states.flatten(0, 1)
-        cumulative_len = torch.cat(cumulative_len, dim=0)
-        attn_output = flash_attn_varlen_func(
-            q_unpad,
-            k_unpad,
-            v_unpad,
-            cumulative_len,
-            cumulative_len,
-            max_seqlen,
-            max_seqlen,
-            0,
-            return_attn_probs=False,
-            causal=True,
-        )
+        attn_output = dist_attn(query_states, key_states, value_states,
+                                cumulative_len, max_seqlen)
+        # q_unpad, k_unpad, v_unpad = query_states.flatten(
+        #     0, 1), key_states.flatten(0, 1), value_states.flatten(0, 1)
+        # cumulative_len = torch.cat(cumulative_len, dim=0)
+        # attn_output = flash_attn_varlen_func(
+        #     q_unpad,
+        #     k_unpad,
+        #     v_unpad,
+        #     cumulative_len,
+        #     cumulative_len,
+        #     max_seqlen,
+        #     max_seqlen,
+        #     0,
+        #     return_attn_probs=False,
+        #     causal=True,
+        # )
     else:
         attn_output = flash_attn_func(
             query_states, key_states, value_states, causal=True)

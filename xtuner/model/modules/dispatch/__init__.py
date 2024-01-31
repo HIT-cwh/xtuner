@@ -163,7 +163,8 @@ def replace_internlm_rote(model):
 def replace_internlm2_rote(model):
     from .internlm2 import InternLM2RotaryEmbedding
 
-    rotary_base = model.config.rope_theta
+    # rotary_base = model.config.rope_theta
+    rotary_base = 1000000
 
     def traverse(module):
         for name, child in module.named_children():
