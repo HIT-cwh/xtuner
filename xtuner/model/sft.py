@@ -37,9 +37,13 @@ class _VocabSequenceParallelCrossEntropy(torch.autograd.Function):
             softmax.log().view(-1, ctx.vocab_size),
             target.view(-1),
             reduction='none')
-        if dist.get_rank() in (0, 1):
-            torch.save(loss.cpu(), f'rank_{dist.get_rank()}.pth')
-
+        # import time
+        # if dist.get_rank() in (0, 1):
+        #     torch.save(loss.cpu(), f'rank_{dist.get_rank()}.pth')
+        #     time.sleep(5)
+        # else:
+        #     time.sleep(200)
+        # assert False
         ctx.seqlen = vocab_seq_parallel_logits.size(
             0) * get_sequence_parallel_world_size()
         batch_size = vocab_seq_parallel_logits.size(1)
@@ -188,35 +192,36 @@ class SupervisedFinetune(BaseModel):
         return logits_dict
 
     def compute_loss(self, data, data_samples=None):
-        labels = data.pop('labels')
-        outputs = self.llm(**data)
+        # labels = data.pop('labels')
+        # outputs = self.llm(**data)
 
-        logits = outputs.logits  # b, s/p, dim
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        shift_logits = shift_logits.transpose(0, 1).contiguous()  # s/p, b, dim
-        shift_labels = shift_labels.transpose(
-            0, 1).contiguous()  # [b s/p] => [s/p b]
-        loss = vocab_sequence_parallel_cross_entropy(shift_logits.float(),
-                                                     shift_labels)
-        # [s b] => [b, s]
-        loss = loss.transpose(0, 1).contiguous()
-        num_tokens = (shift_labels != -100).sum()
-        sequence_parallel_group = get_sequence_parallel_group()
-        dist.all_reduce(num_tokens, group=sequence_parallel_group)
-        loss = loss.sum() / num_tokens
-
-        # labels = data['labels']
-        # num_tokens = (labels != -100).sum()
+        # logits = outputs.logits  # b, s/p, dim
+        # shift_logits = logits[..., :-1, :].contiguous()
+        # shift_labels = labels[..., 1:].contiguous()
+        # shift_logits = shift_logits.transpose(0, 1).contiguous()  # s/p, b, dim
+        # shift_labels = shift_labels.transpose(
+        #     0, 1).contiguous()  # [b s/p] => [s/p b]
+        # loss = vocab_sequence_parallel_cross_entropy(shift_logits.float(),
+        #                                              shift_labels)
+        # # [s b] => [b, s]
+        # loss = loss.transpose(0, 1).contiguous()
+        # num_tokens = (shift_labels != -100).sum()
         # sequence_parallel_group = get_sequence_parallel_group()
+        # dist.all_reduce(num_tokens, group=sequence_parallel_group)
+        # loss = loss.sum() / num_tokens
+        # loss_dict = {'loss': loss}
+
+        outputs = self.llm(**data)
+        labels = data['labels']
+        num_tokens = (labels != -100).sum()
+        sequence_parallel_group = get_sequence_parallel_group()
         # with open('debug.txt', 'a+') as f:
         #     f.write(f'{num_tokens}, {dist.get_rank()} \n')
-        # loss = outputs.loss * num_tokens
-        # dist.all_reduce(loss, group=sequence_parallel_group)
-        # dist.all_reduce(num_tokens, group=sequence_parallel_group)
-        # loss = loss / num_tokens
-        loss_dict = {'loss': loss}
-        # loss_dict = {'loss': outputs.loss}
+        loss = outputs.loss * num_tokens
+        dist.all_reduce(loss, group=sequence_parallel_group)
+        dist.all_reduce(num_tokens, group=sequence_parallel_group)
+        loss = loss / num_tokens
+        loss_dict = {'loss': outputs.loss}
         return loss_dict
 
     def state_dict(self, *args, **kwargs):
