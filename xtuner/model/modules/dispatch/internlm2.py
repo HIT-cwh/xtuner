@@ -224,13 +224,21 @@ class _SeqAllToAll(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any,
                  *grad_output: Tensor) -> Tuple[None, Tensor, None, None]:
-        return (None,
-                _SeqAllToAll.apply(ctx.group, *grad_output, ctx.gather_idx,
-                                   ctx.scatter_idx), None, None)
+        grad = _SeqAllToAll.apply(ctx.group, *grad_output, ctx.gather_idx,
+                                   ctx.scatter_idx)
+        sequence_process_world_size = get_sequence_parallel_world_size()
+        d0, d1, d2, d3 = grad.shape
+        if ctx.scatter_idx == 2:
+            d0, d1, d2, d3 = grad.shape
+            if get_sequence_parallel_world_size() == 1:
+                pass
+            elif get_sequence_parallel_world_size() == 2:
+                grad = grad.reshape(d0, 2, d1//2, 2, d2//2, d3).permute(0, 2, 3, 1, 4, 5).reshape(d0, d1, d2, d3)
+            else:
+                grad = grad.reshape(d0, sequence_process_world_size, d1, d2//sequence_process_world_size, d3).transpose(1, 2).reshape(d0, d1, d2, d3)
 
+        return (None, grad, None, None)
 
-scatter_idx = 2
-gather_idx = 0
 
 from xtuner.engine._strategy.deepspeed import (get_sequence_parallel_group,
                                                get_sequence_parallel_world_size
@@ -239,6 +247,8 @@ from xtuner.engine._strategy.deepspeed import (get_sequence_parallel_group,
 
 def dist_attn(query_states, key_states, value_states, cumulative_len,
               max_seqlen):
+    scatter_idx = 2
+    gather_idx = 0
     # b, s, nd, dim
     sequence_process_world_size = get_sequence_parallel_world_size()
     # if sequence_process_world_size > 1:

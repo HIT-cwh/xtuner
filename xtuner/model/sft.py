@@ -221,7 +221,7 @@ class SupervisedFinetune(BaseModel):
         dist.all_reduce(loss, group=sequence_parallel_group)
         dist.all_reduce(num_tokens, group=sequence_parallel_group)
         loss = loss / num_tokens
-        loss_dict = {'loss': outputs.loss}
+        loss_dict = {'loss': loss}
         return loss_dict
 
     def state_dict(self, *args, **kwargs):
