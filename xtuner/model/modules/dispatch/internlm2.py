@@ -63,6 +63,50 @@ class InternLM2RotaryEmbedding(torch.nn.Module):
         )
 
 
+class InternLM2DynamicNTKScalingRotaryEmbedding(torch.nn.Module):
+
+    def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None, scaling_factor=1.0):
+        self.scaling_factor = scaling_factor
+        self.dim = dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        # Build here to make `torch.jit.trace` work.
+        self._set_cos_sin_cache(
+            seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
+        )
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+
+        if seq_len > self.max_position_embeddings:
+            base = self.base * (
+                (self.scaling_factor * seq_len / self.max_position_embeddings) - (self.scaling_factor - 1)
+            ) ** (self.dim / (self.dim - 2))
+            inv_freq = 1.0 / (base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
+            self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+    
+    def forward(self, x, seq_len=None):
+        # x: [bs, num_attention_heads, seq_len, head_size]
+        if seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=torch.float32)
+
+        return (
+            self.cos_cached[:seq_len].to(dtype=x.dtype),
+            self.sin_cached[:seq_len].to(dtype=x.dtype),
+        )
+
+
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., :x.shape[-1] // 2]
@@ -247,11 +291,16 @@ from xtuner.engine._strategy.deepspeed import (get_sequence_parallel_group,
 
 def dist_attn(query_states, key_states, value_states, cumulative_len,
               max_seqlen):
+    sequence_parallel_world_size = get_sequence_parallel_world_size()
+    bs, seq_len, n_head, head_dim = query_states.shape
+    assert n_head % sequence_parallel_world_size == 0, \
+        ('The number of attention heads should be divisible by '
+        f'sequence_parallel_world_size. But got n_head = {n_head} and '
+        f'sequence_parallel_world_size = {sequence_parallel_world_size}.')
+
     scatter_idx = 2
     gather_idx = 0
-    # b, s, nd, dim
-    sequence_process_world_size = get_sequence_parallel_world_size()
-    # if sequence_process_world_size > 1:
+    
     sequence_process_group = get_sequence_parallel_group()
     query_states = _SeqAllToAll.apply(sequence_process_group, query_states,
                                       scatter_idx, gather_idx)
@@ -275,14 +324,29 @@ def dist_attn(query_states, key_states, value_states, cumulative_len,
         return_attn_probs=False,
         causal=True,
     )
-    # if sequence_process_world_size > 1:
     attn_output = attn_output.unsqueeze(1)
 
     output = _SeqAllToAll.apply(sequence_process_group, attn_output,
                                 gather_idx, scatter_idx)
-    # else:
-    #     output = attn_output
+    
     return output
+
+
+def repeat_kv_bshd(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    The hidden states go from (batch, seqlen, num_key_value_heads, head_dim) to
+    (batch, seqlen, num_attention_heads, head_dim)
+    """
+    batch, slen, num_key_value_heads, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :,
+                                  :, None, :].expand(batch,
+                                                     slen,
+                                                     num_key_value_heads,
+                                                     n_rep, head_dim)
+    return hidden_states.reshape(batch, slen, num_key_value_heads * n_rep, 
+                                 head_dim)
 
 
 def internlm2_varlen_attn_forward(
@@ -352,6 +416,10 @@ def internlm2_varlen_attn_forward(
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
 
+    # repeat kv for sequence parallel
+    key_states = repeat_kv_bshd(key_states, self.num_key_value_groups)
+    value_states = repeat_kv_bshd(value_states, self.num_key_value_groups)
+    
     assert SUPPORT_FLASH2
     if is_training:
         attn_output = dist_attn(query_states, key_states, value_states,
