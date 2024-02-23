@@ -4,8 +4,10 @@ from typing import Iterator, Optional, Sized
 
 import numpy as np
 from mmengine import print_log
-from mmengine.dist import get_dist_info
 from torch.utils.data import Sampler
+
+from xtuner.engine._strategy.deepspeed import (get_data_parallel_rank,
+                                               get_data_parallel_world_size)
 
 
 class InternRepoSampler(Sampler):
@@ -17,17 +19,18 @@ class InternRepoSampler(Sampler):
         if seed is not None and seed != 1024:
             warnings.warn('For alignment accuracy, seed in InternRepoSampler'
                           'must be set to 1024.')
-        rank, world_size = get_dist_info()
+        dp_world_size = get_data_parallel_world_size()
+        rank = get_data_parallel_rank()
         self.rank = rank
-        self.world_size = world_size
+        self.dp_world_size = dp_world_size
 
         self.dataset = dataset
         self.shuffle = shuffle
         self.seed = 1024
         self.epoch = 0
 
-        self.num_samples = len(self.dataset) // world_size
-        self.total_size = self.num_samples * world_size
+        self.num_samples = len(self.dataset) // dp_world_size
+        self.total_size = self.num_samples * dp_world_size
 
     def __iter__(self) -> Iterator[int]:
         """Iterate the indices."""
@@ -43,7 +46,7 @@ class InternRepoSampler(Sampler):
         self.indices = indices[:self.total_size]
 
         # subsample
-        indices = indices[self.rank:self.total_size:self.world_size]
+        indices = indices[self.rank:self.total_size:self.dp_world_size]
         self.subsample_indices = indices
 
         return iter(indices)

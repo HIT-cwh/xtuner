@@ -1,13 +1,17 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import warnings
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange
 from mmengine import MessageHub
+from torch import Tensor
 
+from xtuner.engine._strategy.deepspeed import (get_sequence_parallel_group,
+                                               get_sequence_parallel_world_size
+                                               )
 from .triton_kernels import apply_rotary_emb
 
 SUPPORT_FLASH2 = False
@@ -94,6 +98,127 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
                                                      n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen,
                                  head_dim)
+
+
+def repeat_kv_bshd(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """The hidden states go from (batch, seqlen, num_key_value_heads, head_dim)
+    to (batch, seqlen, num_attention_heads, head_dim)"""
+    batch, slen, num_key_value_heads, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, :,
+                                  None, :].expand(batch, slen,
+                                                  num_key_value_heads, n_rep,
+                                                  head_dim)
+    return hidden_states.reshape(batch, slen, num_key_value_heads * n_rep,
+                                 head_dim)
+
+
+def single_all_to_all(input, scatter_idx, gather_idx, group):
+    seq_world_size = dist.get_world_size(group)
+    inp_shape = list(input.shape)
+    inp_shape[scatter_idx] = inp_shape[scatter_idx] // seq_world_size
+    if scatter_idx < 2:
+        input_t = input.reshape([seq_world_size, inp_shape[scatter_idx]] +
+                                inp_shape[scatter_idx + 1:]).contiguous()
+    else:
+        # transpose groups of heads with the seq-len parallel dimension,
+        # so that we can scatter them!
+        input_t = input.reshape([-1, seq_world_size, inp_shape[scatter_idx]] +
+                                inp_shape[scatter_idx + 1:]).transpose(
+                                    0, 1).contiguous()  # (2, 16k, 16, 128)
+
+    output = torch.empty_like(input_t)
+    dist.all_to_all_single(output, input_t, group=group)
+
+    # if scattering the seq-dim, transpose the heads back to
+    # the original dimension
+    if scatter_idx < 2:
+        output = output.transpose(0, 1).contiguous()
+
+    return output.reshape(
+        inp_shape[: gather_idx] + \
+        [inp_shape[gather_idx] * seq_world_size] + \
+        inp_shape[gather_idx + 1:]).contiguous()  # (2, 16k, 16, 128)
+
+
+class _SeqAllToAll(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx: Any, group: dist.ProcessGroup, input: Tensor,
+                scatter_idx: int, gather_idx: int) -> Tensor:
+
+        ctx.group = group
+        ctx.scatter_idx = scatter_idx
+        ctx.gather_idx = gather_idx
+
+        return single_all_to_all(input, scatter_idx, gather_idx, group)
+
+    @staticmethod
+    def backward(ctx: Any,
+                 *grad_output: Tensor) -> Tuple[None, Tensor, None, None]:
+        grad = _SeqAllToAll.apply(ctx.group, *grad_output, ctx.gather_idx,
+                                  ctx.scatter_idx)
+        sequence_process_world_size = get_sequence_parallel_world_size()
+        d0, d1, d2, d3 = grad.shape
+        if ctx.scatter_idx == 2:
+            d0, d1, d2, d3 = grad.shape
+            if get_sequence_parallel_world_size() == 1:
+                pass
+            elif get_sequence_parallel_world_size() == 2:
+                grad = grad.reshape(d0, 2, d1 // 2, 2, d2 // 2,
+                                    d3).permute(0, 2, 3, 1, 4,
+                                                5).reshape(d0, d1, d2, d3)
+            else:
+                grad = grad.reshape(d0, sequence_process_world_size, d1,
+                                    d2 // sequence_process_world_size,
+                                    d3).transpose(1,
+                                                  2).reshape(d0, d1, d2, d3)
+
+        return (None, grad, None, None)
+
+
+def dist_attn(query_states, key_states, value_states, cumulative_len,
+              max_seqlen):
+    sequence_parallel_world_size = get_sequence_parallel_world_size()
+    n_head = query_states.shape[2]
+    assert n_head % sequence_parallel_world_size == 0, \
+        ('The number of attention heads should be divisible by '
+        f'sequence_parallel_world_size. But got n_head = {n_head} and '
+        f'sequence_parallel_world_size = {sequence_parallel_world_size}.')
+
+    scatter_idx = 2
+    gather_idx = 0
+
+    sequence_process_group = get_sequence_parallel_group()
+    query_states = _SeqAllToAll.apply(sequence_process_group, query_states,
+                                      scatter_idx, gather_idx)
+    key_states = _SeqAllToAll.apply(sequence_process_group, key_states,
+                                    scatter_idx, gather_idx)
+    value_states = _SeqAllToAll.apply(sequence_process_group, value_states,
+                                      scatter_idx, gather_idx)
+
+    q_unpad, k_unpad, v_unpad = query_states.flatten(0, 1), key_states.flatten(
+        0, 1), value_states.flatten(0, 1)
+    cumulative_len = torch.cat(cumulative_len, dim=0)
+    attn_output = flash_attn_varlen_func(
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cumulative_len,
+        cumulative_len,
+        max_seqlen,
+        max_seqlen,
+        0,
+        return_attn_probs=False,
+        causal=True,
+    )
+    attn_output = attn_output.unsqueeze(1)
+
+    output = _SeqAllToAll.apply(sequence_process_group, attn_output,
+                                gather_idx, scatter_idx)
+
+    return output
 
 
 def internlm2_attn_forward(
@@ -238,23 +363,14 @@ def internlm2_varlen_attn_forward(
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
 
+    # repeat kv for sequence parallel
+    key_states = repeat_kv_bshd(key_states, self.num_key_value_groups)
+    value_states = repeat_kv_bshd(value_states, self.num_key_value_groups)
+
     assert SUPPORT_FLASH2
     if is_training:
-        q_unpad, k_unpad, v_unpad = query_states.flatten(
-            0, 1), key_states.flatten(0, 1), value_states.flatten(0, 1)
-        cumulative_len = torch.cat(cumulative_len, dim=0)
-        attn_output = flash_attn_varlen_func(
-            q_unpad,
-            k_unpad,
-            v_unpad,
-            cumulative_len,
-            cumulative_len,
-            max_seqlen,
-            max_seqlen,
-            0,
-            return_attn_probs=False,
-            causal=True,
-        )
+        attn_output = dist_attn(query_states, key_states, value_states,
+                                cumulative_len, max_seqlen)
     else:
         attn_output = flash_attn_func(
             query_states, key_states, value_states, causal=True)

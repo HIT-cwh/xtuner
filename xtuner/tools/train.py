@@ -76,6 +76,20 @@ def register_function(cfg_dict):
             register_function(value)
 
 
+def check_cfg(cfg):
+    if getattr(cfg, 'use_varlen_attn',
+               False) and cfg.train_dataloader.batch_size > 1:
+        raise NotImplementedError(
+            f'If utilizing varlen attention, the batch size should be'
+            f' set to 1, but got {cfg.train_dataloader.batch_size}')
+
+    # if getattr(cfg, 'sequence_parallel', 1) > 1 and cfg.train_dataloader.batch_size > 1:
+    #     raise NotImplementedError(
+    #         'Currently we only support `batch_size == 1` when using '
+    #         'sequence parallel, but got '
+    #         f'batch_size = {cfg.train_dataloader.batch_size}')
+
+
 def main():
     args = parse_args()
 
@@ -95,6 +109,8 @@ def main():
     # register FunctionType object in cfg to `MAP_FUNC` Registry and
     # change these FunctionType object to str
     register_function(cfg._cfg_dict)
+
+    check_cfg(cfg)
 
     if cfg.get('framework', 'mmengine').lower() == 'huggingface':
         # set default training_args
@@ -277,7 +293,8 @@ def main():
                     gradient_accumulation_steps=grad_accum,
                     train_micro_batch_size_per_gpu=train_bs,
                     gradient_clipping=grad_clip,
-                    exclude_frozen_parameters=exclude_frozen_parameters)
+                    exclude_frozen_parameters=exclude_frozen_parameters,
+                    sp_size=getattr(cfg, 'sequence_parallel', 1))
                 cfg.__setitem__('strategy', strategy)
                 optim_wrapper = dict(
                     type='DeepSpeedOptimWrapper',
