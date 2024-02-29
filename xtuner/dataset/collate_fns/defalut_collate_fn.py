@@ -10,19 +10,31 @@ from xtuner.engine._strategy.deepspeed import (get_sequence_parallel_rank,
 from xtuner.utils import DEFAULT_PAD_TOKEN_INDEX, IGNORE_INDEX
 
 
-def pad_for_sequence_parallel(input_ids,
-                              labels,
+def pad_for_sequence_parallel(tensor,
                               seq_parallel_world_size,
                               pad_index=DEFAULT_PAD_TOKEN_INDEX):
-    seq_length = len(input_ids)
-    if seq_length % seq_parallel_world_size == 0:
-        return input_ids, labels
+    bs, seq_len = tensor.shape
+    if seq_len % seq_parallel_world_size == 0:
+        return tensor
+    
+    pad_num = seq_parallel_world_size - (seq_len % seq_parallel_world_size)
+    pad = torch.full((bs, pad_num), pad_index, dtype=tensor.dtype, device=tensor.device)
+    tensor = torch.cat([tensor, pad], dim=1)
+    return tensor
 
-    pad_num = seq_parallel_world_size - (seq_length % seq_parallel_world_size)
-    input_ids += [pad_index] * pad_num
-    labels += [IGNORE_INDEX] * pad_num
 
-    return input_ids, labels
+def split_for_sequence_parallel(input_ids, labels, position_ids):
+    seq_parallel_world_size = get_sequence_parallel_world_size()
+    seq_parallel_world_rank = get_sequence_parallel_rank()
+    seq_len = input_ids.size(1)
+    assert seq_len % seq_parallel_world_size == 0
+    sub_seq_len = seq_len // seq_parallel_world_size
+    sub_seq_start = seq_parallel_world_rank * sub_seq_len
+    sub_seq_end = (seq_parallel_world_rank + 1) * sub_seq_len
+    input_ids = input_ids[:, sub_seq_start:sub_seq_end]
+    labels = labels[:, sub_seq_start:sub_seq_end]
+    position_ids = position_ids[:, sub_seq_start:sub_seq_end]
+    return input_ids, labels, position_ids
 
 
 def default_collate_fn(instances: Sequence[Dict],
@@ -31,12 +43,11 @@ def default_collate_fn(instances: Sequence[Dict],
                        use_varlen_attn: bool = False):
 
     seq_parallel_world_size = get_sequence_parallel_world_size()
-    seq_parallel_world_rank = get_sequence_parallel_rank()
 
-    input_ids, labels = [], []
+    input_ids, labels, position_ids = [], [], []
     has_image = any(inst.get('pixel_values') is not None for inst in instances)
     if use_varlen_attn:
-        cumulative_len, indexes = [], []
+        cumulative_len= []
         assert len(instances) == 1, (
             f'If utilizing varlen attention, the batch size should be'
             f' set to 1, but got {len(instances)}')
@@ -45,27 +56,13 @@ def default_collate_fn(instances: Sequence[Dict],
 
     if has_image:
         pixel_values = []
-
+    
     for example in instances:
-        cur_input_ids = example['input_ids']
-        cur_labels = example['labels']
-        cur_input_ids, cur_labels = pad_for_sequence_parallel(
-            cur_input_ids, cur_labels, seq_parallel_world_size, pad_index)
-
-        seq_length = len(cur_input_ids)
-        assert seq_length % seq_parallel_world_size == 0
-        sub_seq_length = seq_length // seq_parallel_world_size
-        sub_seq_start = seq_parallel_world_rank * sub_seq_length
-        sub_seq_end = (seq_parallel_world_rank + 1) * sub_seq_length
-
-        input_ids.append(
-            torch.LongTensor(cur_input_ids[sub_seq_start:sub_seq_end]))
-        labels.append(torch.LongTensor(cur_labels[sub_seq_start:sub_seq_end]))
+        input_ids.append(torch.LongTensor(example['input_ids']))
+        labels.append(torch.LongTensor(example['labels']))
         if use_varlen_attn:
             cumulative_len.append(torch.IntTensor(example['cumulative_len']))
-            indexes.append(
-                torch.LongTensor(
-                    example['indexes'][sub_seq_start:sub_seq_end]))
+            position_ids.append(torch.LongTensor(example['indexes']))
 
         if has_image:
             pixel_values.append(example['pixel_values'])
@@ -78,23 +75,34 @@ def default_collate_fn(instances: Sequence[Dict],
     else:
         input_ids = torch.stack(input_ids)
         labels = torch.stack(labels)
+    
+    if use_varlen_attn:
+        assert input_ids.size(1) % seq_parallel_world_size == 0
+        position_ids = torch.stack(position_ids, dim=0)
+    else:
+        input_ids = pad_for_sequence_parallel(input_ids, seq_parallel_world_size, pad_index)
+        labels = pad_for_sequence_parallel(labels, seq_parallel_world_size, IGNORE_INDEX)
+        attention_mask = input_ids.ne(pad_index)
+        position_ids = attention_mask.long().cumsum(-1) - 1
+
+    input_ids, labels, position_ids = split_for_sequence_parallel(input_ids, labels, position_ids)
 
     if use_varlen_attn:
-        indexes = torch.stack(indexes, dim=0)
         max_seqlen = (
             cumulative_len[0][1:] -  # noqa: W504
             cumulative_len[0][:-1]).max().item()
         data_dict = {
             'input_ids': input_ids,
             'cumulative_len': cumulative_len,
-            'indexes': indexes,
+            'indexes': position_ids,
             'labels': labels,
             'max_seqlen': max_seqlen
         }
     else:
         data_dict = {
             'input_ids': input_ids,
-            'attention_mask': input_ids.ne(pad_index),
+            'attention_mask': attention_mask,
+            'position_ids': position_ids,
             'labels': labels
         }
 

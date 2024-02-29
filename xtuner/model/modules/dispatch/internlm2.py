@@ -10,15 +10,16 @@ from mmengine import MessageHub
 from torch import Tensor
 
 from xtuner.engine._strategy.deepspeed import (get_sequence_parallel_group,
-                                               get_sequence_parallel_world_size
+                                               get_sequence_parallel_world_size, get_sequence_parallel_rank
                                                )
 from .triton_kernels import apply_rotary_emb
+from .utils import pre_process_for_sequence_parallel_attn, post_process_for_sequence_parallel_attn, upad_qkv
 
 SUPPORT_FLASH2 = False
 
 try:
     from flash_attn import flash_attn_func, flash_attn_varlen_func
-
+    from flash_attn.bert_padding import pad_input
     SUPPORT_FLASH2 = True
 except ImportError:
     pass
@@ -114,89 +115,76 @@ def repeat_kv_bshd(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
                                  head_dim)
 
 
-def single_all_to_all(input, scatter_idx, gather_idx, group):
-    seq_world_size = dist.get_world_size(group)
-    inp_shape = list(input.shape)
-    inp_shape[scatter_idx] = inp_shape[scatter_idx] // seq_world_size
-    if scatter_idx < 2:
-        input_t = input.reshape([seq_world_size, inp_shape[scatter_idx]] +
-                                inp_shape[scatter_idx + 1:]).contiguous()
-    else:
-        # transpose groups of heads with the seq-len parallel dimension,
-        # so that we can scatter them!
-        input_t = input.reshape([-1, seq_world_size, inp_shape[scatter_idx]] +
-                                inp_shape[scatter_idx + 1:]).transpose(
-                                    0, 1).contiguous()  # (2, 16k, 16, 128)
-
-    output = torch.empty_like(input_t)
-    dist.all_to_all_single(output, input_t, group=group)
-
-    # if scattering the seq-dim, transpose the heads back to
-    # the original dimension
-    if scatter_idx < 2:
-        output = output.transpose(0, 1).contiguous()
-
-    return output.reshape(
-        inp_shape[: gather_idx] + \
-        [inp_shape[gather_idx] * seq_world_size] + \
-        inp_shape[gather_idx + 1:]).contiguous()  # (2, 16k, 16, 128)
+def attn_wo_mask(query_states, key_states, value_states, causal, is_training, dropout_rate=0.0, name=None):
+    if is_training:
+        query_states, key_states, value_states = pre_process_for_sequence_parallel_attn(
+            query_states, key_states, value_states)
+    # if is_training and dist.get_rank() == 0:
+    #     torch.save(query_states.cpu(), f'q_before_attn_sp{get_sequence_parallel_world_size()}.pth')
+    attn_output = flash_attn_func(
+        query_states, key_states, value_states, dropout_rate, causal=causal
+    )
+    # if is_training and 'layers.0' in name:
+    #     if dist.get_rank() == 0:
+    #         breakpoint()
+        # else:
+        #     import time
+        #     time.sleep(10000)
+    if is_training:
+        attn_output = post_process_for_sequence_parallel_attn(attn_output).contiguous()
+    # if dist.get_rank() == 0:
+    #     breakpoint()
+    return attn_output
 
 
-class _SeqAllToAll(torch.autograd.Function):
+def attn_w_mask(query_states, key_states, value_states, attention_mask, causal, is_training, dropout_rate=0.0, name=None):
+    if is_training:
+        query_states, key_states, value_states = pre_process_for_sequence_parallel_attn(
+            query_states, key_states, value_states)
+    batch_size, q_len = query_states.shape[:2]
+    query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = upad_qkv(
+        query_states, key_states, value_states, attention_mask, q_len
+    )
+    # if is_training and dist.get_rank() == 0:
+    #     torch.save(query_states.cpu(), f'q_before_attn_sp{get_sequence_parallel_world_size()}.pth')
 
-    @staticmethod
-    def forward(ctx: Any, group: dist.ProcessGroup, input: Tensor,
-                scatter_idx: int, gather_idx: int) -> Tensor:
+    cu_seqlens_q, cu_seqlens_k = cu_seq_lens
+    # print(cu_seqlens_q, cu_seqlens_k)
+    max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
+    attn_output_unpad = flash_attn_varlen_func(
+        query_states,
+        key_states,
+        value_states,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_in_batch_q,
+        max_seqlen_k=max_seqlen_in_batch_k,
+        dropout_p=dropout_rate,
+        causal=causal,
+    )
+    attn_output = pad_input(attn_output_unpad, indices_q, batch_size, q_len)
+    # if is_training and 'layers.0' in name:
+    #     if dist.get_rank() == 0:
+    #         # torch.save(attn_output.cpu(), f'attn_sp{get_sequence_parallel_world_size()}.pth')
+    #         breakpoint()
+        # else:
+        #     import time
+        #     time.sleep(10000)
 
-        ctx.group = group
-        ctx.scatter_idx = scatter_idx
-        ctx.gather_idx = gather_idx
-
-        return single_all_to_all(input, scatter_idx, gather_idx, group)
-
-    @staticmethod
-    def backward(ctx: Any,
-                 *grad_output: Tensor) -> Tuple[None, Tensor, None, None]:
-        grad = _SeqAllToAll.apply(ctx.group, *grad_output, ctx.gather_idx,
-                                  ctx.scatter_idx)
-        sequence_process_world_size = get_sequence_parallel_world_size()
-        d0, d1, d2, d3 = grad.shape
-        if ctx.scatter_idx == 2:
-            d0, d1, d2, d3 = grad.shape
-            if get_sequence_parallel_world_size() == 1:
-                pass
-            elif get_sequence_parallel_world_size() == 2:
-                grad = grad.reshape(d0, 2, d1 // 2, 2, d2 // 2,
-                                    d3).permute(0, 2, 3, 1, 4,
-                                                5).reshape(d0, d1, d2, d3)
-            else:
-                grad = grad.reshape(d0, sequence_process_world_size, d1,
-                                    d2 // sequence_process_world_size,
-                                    d3).transpose(1,
-                                                  2).reshape(d0, d1, d2, d3)
-
-        return (None, grad, None, None)
+    if is_training:
+        attn_output = post_process_for_sequence_parallel_attn(attn_output).contiguous()
+    # if dist.get_rank() in range(4):
+    #     torch.save(attn_output.cpu(), f'attn_sp4_rank{dist.get_rank()}.pth')
+    # if dist.get_rank() == 0:
+    #     breakpoint()
+    return attn_output
 
 
-def dist_attn(query_states, key_states, value_states, cumulative_len,
+def dist_varlen_attn(query_states, key_states, value_states, cumulative_len,
               max_seqlen):
-    sequence_parallel_world_size = get_sequence_parallel_world_size()
-    n_head = query_states.shape[2]
-    assert n_head % sequence_parallel_world_size == 0, \
-        ('The number of attention heads should be divisible by '
-        f'sequence_parallel_world_size. But got n_head = {n_head} and '
-        f'sequence_parallel_world_size = {sequence_parallel_world_size}.')
-
-    scatter_idx = 2
-    gather_idx = 0
-
-    sequence_process_group = get_sequence_parallel_group()
-    query_states = _SeqAllToAll.apply(sequence_process_group, query_states,
-                                      scatter_idx, gather_idx)
-    key_states = _SeqAllToAll.apply(sequence_process_group, key_states,
-                                    scatter_idx, gather_idx)
-    value_states = _SeqAllToAll.apply(sequence_process_group, value_states,
-                                      scatter_idx, gather_idx)
+    # b, s, nd, dim
+    query_states, key_states, value_states = pre_process_for_sequence_parallel_attn(
+        query_states, key_states, value_states)
 
     q_unpad, k_unpad, v_unpad = query_states.flatten(0, 1), key_states.flatten(
         0, 1), value_states.flatten(0, 1)
@@ -213,15 +201,97 @@ def dist_attn(query_states, key_states, value_states, cumulative_len,
         return_attn_probs=False,
         causal=True,
     )
-    attn_output = attn_output.unsqueeze(1)
+    attn_output = attn_output.unsqueeze(0)
 
-    output = _SeqAllToAll.apply(sequence_process_group, attn_output,
-                                gather_idx, scatter_idx)
-
-    return output
+    attn_output = post_process_for_sequence_parallel_attn(attn_output).contiguous()
+    return attn_output
 
 
 def internlm2_attn_forward(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.LongTensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    **kwargs,
+):
+    if "padding_mask" in kwargs:
+        warnings.warn(
+            "Passing `padding_mask` is deprecated and will be removed in v4.37. "
+            "Please make sure use `attention_mask` instead.`"
+        )
+
+        # overwrite attention_mask with padding_mask
+        attention_mask = kwargs.pop("padding_mask")
+
+    output_attentions = False
+
+    bsz, q_len, _ = hidden_states.size()
+
+    qkv_states = self.wqkv(hidden_states)
+
+    qkv_states = rearrange(
+        qkv_states,
+        "b q (h gs d) -> b q h gs d",
+        gs=2 + self.num_key_value_groups,
+        d=self.head_dim,
+    )
+
+    query_states = qkv_states[..., : self.num_key_value_groups, :]
+    query_states = rearrange(query_states, "b q h gs d -> b q (h gs) d")
+    key_states = qkv_states[..., -2, :]
+    value_states = qkv_states[..., -1, :]
+
+    query_states = query_states.transpose(1, 2)
+    key_states = key_states.transpose(1, 2)
+    value_states = value_states.transpose(1, 2)
+
+    kv_seq_len = key_states.shape[-2]
+    if past_key_value is not None:
+        kv_seq_len += past_key_value[0].shape[-2]
+    
+    assert position_ids is not None and (position_ids.max() + 1) >= kv_seq_len
+    cos, sin = self.rotary_emb(value_states, seq_len=position_ids.max() + 1)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states,
+                                                    cos, sin, position_ids)
+    
+    if past_key_value is not None:
+        # reuse k, v, self_attention
+        key_states = torch.cat([past_key_value[0], key_states], dim=2)
+        value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
+    past_key_value = (key_states, value_states) if use_cache else None
+
+    query_states = query_states.transpose(1, 2)
+    key_states = key_states.transpose(1, 2)
+    value_states = value_states.transpose(1, 2)
+
+    # flash attn 2
+    causal = self.is_causal and q_len != 1
+
+    if attention_mask is not None:
+        attn_output = attn_w_mask(query_states, key_states, value_states, attention_mask, causal, self.training, name=self.name)
+    else:
+        attn_output = attn_wo_mask(query_states, key_states, value_states, causal, self.training, name=self.name)
+
+    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+    # if dist.get_rank() in range(4):
+    #     torch.save(attn_output.cpu(), f'attn_sp{get_sequence_parallel_world_size()}_rank{dist.get_rank()}.pth')
+    # if dist.get_rank() == 0:
+    #     breakpoint()
+    attn_output = self.wo(attn_output)
+    # if dist.get_rank() == 0:
+    #     breakpoint()
+
+    if not output_attentions:
+        attn_weights = None
+
+    return attn_output, attn_weights, past_key_value
+
+
+def internlm2_attn_forward_legacy(
     self,
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
@@ -260,7 +330,8 @@ def internlm2_attn_forward(
     kv_seq_len = key_states.shape[-2]
     if past_key_value is not None:
         kv_seq_len += past_key_value[0].shape[-2]
-    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+    assert position_ids is not None and (position_ids.max() + 1) >= kv_seq_len
+    cos, sin = self.rotary_emb(value_states, seq_len=position_ids.max() + 1)
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states,
                                                     cos, sin, position_ids)
 
@@ -369,7 +440,7 @@ def internlm2_varlen_attn_forward(
 
     assert SUPPORT_FLASH2
     if is_training:
-        attn_output = dist_attn(query_states, key_states, value_states,
+        attn_output = dist_varlen_attn(query_states, key_states, value_states,
                                 cumulative_len, max_seqlen)
     else:
         attn_output = flash_attn_func(
