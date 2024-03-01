@@ -112,6 +112,31 @@ def replace_llama_rote(model):
     traverse(model)
 
 
+def replace_llama_rote_yarn(model):
+    from .llama_yarn import LlamaYaRNScaledRotaryEmbedding
+
+    def traverse(module):
+        for name, child in module.named_children():
+            if type(child).__name__ in (
+                    'LlamaRotaryEmbedding',
+                    'LlamaLinearScalingRotaryEmbedding',
+                    'LlamaDynamicNTKScalingRotaryEmbedding'):
+                print_log('replace llama rope to yarn', 'current')
+                original_max_position_embeddings = 4 * 2**10
+                scaling_factor = 64 / 4
+                child_new = LlamaYaRNScaledRotaryEmbedding(
+                    child.dim,
+                    max_position_embeddings=64 * 2**10,
+                    scale=scaling_factor,
+                    original_max_position_embeddings=original_max_position_embeddings
+                ).to(device=child.inv_freq.device, dtype=child.inv_freq.dtype)
+                setattr(module, name, child_new)
+            else:
+                traverse(child)
+
+    traverse(model)
+
+
 def dispatch_internlm_attn_forward(model, use_varlen_attn):
     if use_varlen_attn:
         assert SUPPORT_FLASH2 and SUPPORT_TRITON, \
@@ -334,7 +359,8 @@ def dispatch_modules(model, use_varlen_attn=False):
         dispatch_llama_attn_forward(model, use_varlen_attn)
         if USE_TRITON_KERNEL:
             dispatch_llama_rmsnorm_forward(model)
-        replace_llama_rote(model)
+        # replace_llama_rote(model)
+        replace_llama_rote_yarn(model)
     elif 'baichuan' in model_name:
         dispath_baichuan2_norm_head_forward(model)
         dispath_baichuan_7b_attn_forward(model)
