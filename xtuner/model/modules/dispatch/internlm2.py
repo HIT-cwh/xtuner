@@ -10,10 +10,12 @@ from mmengine import MessageHub
 from torch import Tensor
 
 from xtuner.engine._strategy.deepspeed import (get_sequence_parallel_group,
-                                               get_sequence_parallel_world_size, get_sequence_parallel_rank
+                                               get_sequence_parallel_rank,
+                                               get_sequence_parallel_world_size
                                                )
 from .triton_kernels import apply_rotary_emb
-from .utils import pre_process_for_sequence_parallel_attn, post_process_for_sequence_parallel_attn, upad_qkv
+from .utils import (post_process_for_sequence_parallel_attn,
+                    pre_process_for_sequence_parallel_attn, upad_qkv)
 
 SUPPORT_FLASH2 = False
 
@@ -115,36 +117,48 @@ def repeat_kv_bshd(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
                                  head_dim)
 
 
-def attn_wo_mask(query_states, key_states, value_states, causal, is_training, dropout_rate=0.0, name=None):
+def attn_wo_mask(query_states,
+                 key_states,
+                 value_states,
+                 causal,
+                 is_training,
+                 dropout_rate=0.0,
+                 name=None):
     if is_training:
         query_states, key_states, value_states = pre_process_for_sequence_parallel_attn(
             query_states, key_states, value_states)
     # if is_training and dist.get_rank() == 0:
     #     torch.save(query_states.cpu(), f'q_before_attn_sp{get_sequence_parallel_world_size()}.pth')
     attn_output = flash_attn_func(
-        query_states, key_states, value_states, dropout_rate, causal=causal
-    )
+        query_states, key_states, value_states, dropout_rate, causal=causal)
     # if is_training and 'layers.0' in name:
     #     if dist.get_rank() == 0:
     #         breakpoint()
-        # else:
-        #     import time
-        #     time.sleep(10000)
+    # else:
+    #     import time
+    #     time.sleep(10000)
     if is_training:
-        attn_output = post_process_for_sequence_parallel_attn(attn_output).contiguous()
+        attn_output = post_process_for_sequence_parallel_attn(
+            attn_output).contiguous()
     # if dist.get_rank() == 0:
     #     breakpoint()
     return attn_output
 
 
-def attn_w_mask(query_states, key_states, value_states, attention_mask, causal, is_training, dropout_rate=0.0, name=None):
+def attn_w_mask(query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                causal,
+                is_training,
+                dropout_rate=0.0,
+                name=None):
     if is_training:
         query_states, key_states, value_states = pre_process_for_sequence_parallel_attn(
             query_states, key_states, value_states)
     batch_size, q_len = query_states.shape[:2]
     query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = upad_qkv(
-        query_states, key_states, value_states, attention_mask, q_len
-    )
+        query_states, key_states, value_states, attention_mask, q_len)
     # if is_training and dist.get_rank() == 0:
     #     torch.save(query_states.cpu(), f'q_before_attn_sp{get_sequence_parallel_world_size()}.pth')
 
@@ -167,12 +181,13 @@ def attn_w_mask(query_states, key_states, value_states, attention_mask, causal, 
     #     if dist.get_rank() == 0:
     #         # torch.save(attn_output.cpu(), f'attn_sp{get_sequence_parallel_world_size()}.pth')
     #         breakpoint()
-        # else:
-        #     import time
-        #     time.sleep(10000)
+    # else:
+    #     import time
+    #     time.sleep(10000)
 
     if is_training:
-        attn_output = post_process_for_sequence_parallel_attn(attn_output).contiguous()
+        attn_output = post_process_for_sequence_parallel_attn(
+            attn_output).contiguous()
     # if dist.get_rank() in range(4):
     #     torch.save(attn_output.cpu(), f'attn_sp4_rank{dist.get_rank()}.pth')
     # if dist.get_rank() == 0:
@@ -181,10 +196,11 @@ def attn_w_mask(query_states, key_states, value_states, attention_mask, causal, 
 
 
 def dist_varlen_attn(query_states, key_states, value_states, cumulative_len,
-              max_seqlen):
+                     max_seqlen):
     # b, s, nd, dim
-    query_states, key_states, value_states = pre_process_for_sequence_parallel_attn(
-        query_states, key_states, value_states)
+    if get_sequence_parallel_world_size() > 1:
+        query_states, key_states, value_states = pre_process_for_sequence_parallel_attn(
+            query_states, key_states, value_states)
 
     q_unpad, k_unpad, v_unpad = query_states.flatten(0, 1), key_states.flatten(
         0, 1), value_states.flatten(0, 1)
@@ -203,7 +219,9 @@ def dist_varlen_attn(query_states, key_states, value_states, cumulative_len,
     )
     attn_output = attn_output.unsqueeze(0)
 
-    attn_output = post_process_for_sequence_parallel_attn(attn_output).contiguous()
+    if get_sequence_parallel_world_size() > 1:
+        attn_output = post_process_for_sequence_parallel_attn(
+            attn_output).contiguous()
     return attn_output
 
 
@@ -217,14 +235,13 @@ def internlm2_attn_forward(
     use_cache: bool = False,
     **kwargs,
 ):
-    if "padding_mask" in kwargs:
+    if 'padding_mask' in kwargs:
         warnings.warn(
-            "Passing `padding_mask` is deprecated and will be removed in v4.37. "
-            "Please make sure use `attention_mask` instead.`"
-        )
+            'Passing `padding_mask` is deprecated and will be removed in v4.37. '
+            'Please make sure use `attention_mask` instead.`')
 
         # overwrite attention_mask with padding_mask
-        attention_mask = kwargs.pop("padding_mask")
+        attention_mask = kwargs.pop('padding_mask')
 
     output_attentions = False
 
@@ -234,13 +251,13 @@ def internlm2_attn_forward(
 
     qkv_states = rearrange(
         qkv_states,
-        "b q (h gs d) -> b q h gs d",
+        'b q (h gs d) -> b q h gs d',
         gs=2 + self.num_key_value_groups,
         d=self.head_dim,
     )
 
-    query_states = qkv_states[..., : self.num_key_value_groups, :]
-    query_states = rearrange(query_states, "b q h gs d -> b q (h gs) d")
+    query_states = qkv_states[..., :self.num_key_value_groups, :]
+    query_states = rearrange(query_states, 'b q h gs d -> b q (h gs) d')
     key_states = qkv_states[..., -2, :]
     value_states = qkv_states[..., -1, :]
 
@@ -251,12 +268,12 @@ def internlm2_attn_forward(
     kv_seq_len = key_states.shape[-2]
     if past_key_value is not None:
         kv_seq_len += past_key_value[0].shape[-2]
-    
+
     assert position_ids is not None and (position_ids.max() + 1) >= kv_seq_len
     cos, sin = self.rotary_emb(value_states, seq_len=position_ids.max() + 1)
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states,
                                                     cos, sin, position_ids)
-    
+
     if past_key_value is not None:
         # reuse k, v, self_attention
         key_states = torch.cat([past_key_value[0], key_states], dim=2)
@@ -272,11 +289,25 @@ def internlm2_attn_forward(
     causal = self.is_causal and q_len != 1
 
     if attention_mask is not None:
-        attn_output = attn_w_mask(query_states, key_states, value_states, attention_mask, causal, self.training, name=self.name)
+        attn_output = attn_w_mask(
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            causal,
+            self.training,
+            name=self.name)
     else:
-        attn_output = attn_wo_mask(query_states, key_states, value_states, causal, self.training, name=self.name)
+        attn_output = attn_wo_mask(
+            query_states,
+            key_states,
+            value_states,
+            causal,
+            self.training,
+            name=self.name)
 
-    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+    attn_output = attn_output.reshape(bsz, q_len,
+                                      self.hidden_size).contiguous()
     # if dist.get_rank() in range(4):
     #     torch.save(attn_output.cpu(), f'attn_sp{get_sequence_parallel_world_size()}_rank{dist.get_rank()}.pth')
     # if dist.get_rank() == 0:
@@ -441,7 +472,7 @@ def internlm2_varlen_attn_forward(
     assert SUPPORT_FLASH2
     if is_training:
         attn_output = dist_varlen_attn(query_states, key_states, value_states,
-                                cumulative_len, max_seqlen)
+                                       cumulative_len, max_seqlen)
     else:
         attn_output = flash_attn_func(
             query_states, key_states, value_states, causal=True)
