@@ -102,7 +102,9 @@ def replace_llama_rote(model):
                 dim_model = child.dim
                 assert child.max_position_embeddings == 4096
                 child_new = LlamaLinearScalingRotaryEmbedding(
-                    dim_model, child.max_position_embeddings, scaling_factor=float(32768/4096)).to(
+                    dim_model,
+                    child.max_position_embeddings,
+                    scaling_factor=float(32768 / 4096)).to(
                         device=child.inv_freq.device,
                         dtype=child.inv_freq.dtype)
                 setattr(module, name, child_new)
@@ -120,16 +122,19 @@ def replace_llama_rote_yarn(model):
             if type(child).__name__ in (
                     'LlamaRotaryEmbedding',
                     'LlamaLinearScalingRotaryEmbedding',
-                    'LlamaDynamicNTKScalingRotaryEmbedding'):
+                    'LlamaDynamicNTKScalingRotaryEmbedding',
+                    'FlashYaRNRotaryEmbedding', 'FlashRotaryEmbedding'):
                 print_log('replace llama rope to yarn', 'current')
                 original_max_position_embeddings = 4 * 2**10
-                scaling_factor = 64 / 4
+                scaling_factor = 128 / 4
                 child_new = LlamaYaRNScaledRotaryEmbedding(
                     child.dim,
-                    max_position_embeddings=64 * 2**10,
+                    max_position_embeddings=128 * 2**10,
                     scale=scaling_factor,
-                    original_max_position_embeddings=original_max_position_embeddings
-                ).to(device=child.inv_freq.device, dtype=child.inv_freq.dtype)
+                    original_max_position_embeddings=
+                    original_max_position_embeddings).to(
+                        device=child.inv_freq.device,
+                        dtype=child.inv_freq.dtype)
                 setattr(module, name, child_new)
             else:
                 traverse(child)
@@ -171,7 +176,8 @@ def dispatch_internlm2_attn_forward(model, use_varlen_attn):
 
     print_log(NO_ATTN_WEIGHTS_MSG, 'current', logging.WARNING)
     for module in model.modules():
-        if type(module).__name__ in ('InternLM2Attention', 'InternLM2FlashAttention2'):
+        if type(module).__name__ in ('InternLM2Attention',
+                                     'InternLM2FlashAttention2'):
             if use_varlen_attn:
                 print_log('dispatch internlm2 varlen attn forward', 'current')
                 module.forward = types.MethodType(
