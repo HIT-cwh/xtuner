@@ -10,17 +10,57 @@ from xtuner.engine._strategy.deepspeed import (get_sequence_parallel_rank,
 from xtuner.utils import DEFAULT_PAD_TOKEN_INDEX, IGNORE_INDEX
 
 
-def pad_for_sequence_parallel(tensor,
-                              seq_parallel_world_size,
-                              pad_index=DEFAULT_PAD_TOKEN_INDEX):
-    bs, seq_len = tensor.shape
+def pad_for_sequence_parallel(
+        tokens, 
+        labels=None, 
+        position_ids=None, 
+        attention_mask=None,
+        tokens_pad_index=DEFAULT_PAD_TOKEN_INDEX,
+        labels_pad_index=IGNORE_INDEX, 
+        position_ids_pad_index=0,
+        attention_mask_pad_index=0):
+    if labels is not None:
+        assert tokens.shape == labels.shape
+    if position_ids is not None:
+        assert tokens.shape == position_ids.shape
+    if attention_mask is not None:
+        assert tokens.shape == attention_mask.shape
+    
+    bs, seq_len = tokens.shape
+    seq_parallel_world_size = get_sequence_parallel_world_size()
     if seq_len % seq_parallel_world_size == 0:
-        return tensor
+        return tokens, labels, position_ids, attention_mask
     
     pad_num = seq_parallel_world_size - (seq_len % seq_parallel_world_size)
-    pad = torch.full((bs, pad_num), pad_index, dtype=tensor.dtype, device=tensor.device)
-    tensor = torch.cat([tensor, pad], dim=1)
-    return tensor
+    pad = torch.full((bs, pad_num), tokens_pad_index, dtype=tokens.dtype, device=tokens.device)
+    tokens = torch.cat([tokens, pad], dim=1)
+
+    if labels is not None:
+        pad = torch.full((bs, pad_num), labels_pad_index, dtype=labels.dtype, device=labels.device)
+        labels = torch.cat([labels, pad], dim=1)
+    
+    if position_ids is not None:
+        pad = torch.full((bs, pad_num), position_ids_pad_index, dtype=position_ids.dtype, device=position_ids.device)
+        position_ids = torch.cat([position_ids, pad], dim=1)
+    
+    if attention_mask is not None:
+        pad = torch.full((bs, pad_num), attention_mask_pad_index, dtype=attention_mask.dtype, device=attention_mask.device)
+        attention_mask = torch.cat([attention_mask, pad], dim=1)
+    
+    return tokens, labels, position_ids, attention_mask
+
+
+# def pad_for_sequence_parallel(tensor,
+#                               seq_parallel_world_size,
+#                               pad_index=DEFAULT_PAD_TOKEN_INDEX):
+#     bs, seq_len = tensor.shape
+#     if seq_len % seq_parallel_world_size == 0:
+#         return tensor
+    
+#     pad_num = seq_parallel_world_size - (seq_len % seq_parallel_world_size)
+#     pad = torch.full((bs, pad_num), pad_index, dtype=tensor.dtype, device=tensor.device)
+#     tensor = torch.cat([tensor, pad], dim=1)
+#     return tensor
 
 
 def split_for_sequence_parallel(input_ids, labels, position_ids):
@@ -78,13 +118,27 @@ def default_collate_fn(instances: Sequence[Dict],
     
     if use_varlen_attn:
         assert input_ids.size(1) % seq_parallel_world_size == 0
+        attention_mask = None
         position_ids = torch.stack(position_ids, dim=0)
     else:
-        input_ids = pad_for_sequence_parallel(input_ids, seq_parallel_world_size, pad_index)
-        labels = pad_for_sequence_parallel(labels, seq_parallel_world_size, IGNORE_INDEX)
         attention_mask = input_ids.ne(pad_index)
         position_ids = attention_mask.long().cumsum(-1) - 1
+    
+    input_ids, labels, position_ids, attention_mask = \
+        pad_for_sequence_parallel(input_ids, labels, position_ids, attention_mask)
+    
 
+    
+    # if use_varlen_attn:
+    #     assert input_ids.size(1) % seq_parallel_world_size == 0
+    #     position_ids = torch.stack(position_ids, dim=0)
+    # else:
+    #     input_ids = pad_for_sequence_parallel(input_ids, seq_parallel_world_size, pad_index)
+    #     labels = pad_for_sequence_parallel(labels, seq_parallel_world_size, IGNORE_INDEX)
+    #     attention_mask = input_ids.ne(pad_index)
+    #     position_ids = attention_mask.long().cumsum(-1) - 1
+
+    # attention mask should not be split
     input_ids, labels, position_ids = split_for_sequence_parallel(input_ids, labels, position_ids)
 
     if use_varlen_attn:

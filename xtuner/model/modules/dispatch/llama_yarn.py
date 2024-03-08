@@ -15,7 +15,8 @@ from xtuner.engine._strategy.deepspeed import (get_sequence_parallel_group,
                                                get_sequence_parallel_rank
                                                )
 from .triton_kernels import apply_rotary_emb
-from .utils import pre_process_for_sequence_parallel_attn, post_process_for_sequence_parallel_attn, upad_qkv
+from .sequence_parallel import pre_process_for_sequence_parallel_attn, post_process_for_sequence_parallel_attn
+from .utils import upad_qkv
 
 logger = logging.get_logger(__name__)
 

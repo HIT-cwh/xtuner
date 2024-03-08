@@ -7,7 +7,7 @@ from mmengine._strategy import DeepSpeedStrategy as MMEngineDeepSpeedStrategy
 from xtuner import DS_CEPH_DIR
 from xtuner.utils.fileio import patch_fileio
 
-# For DeepSpeed's sequence parallel
+
 _SEQUENCE_PARALLEL_GROUP = None
 _SEQUENCE_PARALLEL_WORLD_SIZE = None
 _SEQUENCE_PARALLEL_RANK = None
@@ -17,7 +17,7 @@ _DATA_PARALLEL_WORLD_SIZE = None
 _DATA_PARALLEL_RANK = None
 
 
-def init_seq_parallel(sequence_parallel_size: int = 1):
+def init_sequence_parallel(sequence_parallel_size: int = 1):
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
 
@@ -165,4 +165,4 @@ class DeepSpeedStrategy(MMEngineDeepSpeedStrategy):
         **kwargs,
     ):
         super()._setup_distributed(launcher, backend, **kwargs)
-        init_seq_parallel(self.sp_size)
+        init_sequence_parallel(self.sp_size)

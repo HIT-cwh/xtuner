@@ -14,8 +14,8 @@ from xtuner.engine._strategy.deepspeed import (get_sequence_parallel_group,
                                                get_sequence_parallel_world_size
                                                )
 from .triton_kernels import apply_rotary_emb
-from .utils import (post_process_for_sequence_parallel_attn,
-                    pre_process_for_sequence_parallel_attn, upad_qkv)
+from .sequence_parallel import sequence_parallel_wrapper
+from .utils import upad_qkv
 
 SUPPORT_FLASH2 = False
 
@@ -117,53 +117,32 @@ def repeat_kv_bshd(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
                                  head_dim)
 
 
-def attn_wo_mask(query_states,
-                 key_states,
-                 value_states,
-                 causal,
-                 is_training,
-                 dropout_rate=0.0,
-                 name=None):
-    if is_training:
-        query_states, key_states, value_states = pre_process_for_sequence_parallel_attn(
-            query_states, key_states, value_states)
-    # if is_training and dist.get_rank() == 0:
-    #     torch.save(query_states.cpu(), f'q_before_attn_sp{get_sequence_parallel_world_size()}.pth')
+@sequence_parallel_wrapper
+def flash_attn_wo_mask(
+        query_states,
+        key_states,
+        value_states,
+        causal,
+        dropout_rate=0.0):
     attn_output = flash_attn_func(
         query_states, key_states, value_states, dropout_rate, causal=causal)
-    # if is_training and 'layers.0' in name:
-    #     if dist.get_rank() == 0:
-    #         breakpoint()
-    # else:
-    #     import time
-    #     time.sleep(10000)
-    if is_training:
-        attn_output = post_process_for_sequence_parallel_attn(
-            attn_output).contiguous()
-    # if dist.get_rank() == 0:
-    #     breakpoint()
     return attn_output
 
 
-def attn_w_mask(query_states,
-                key_states,
-                value_states,
-                attention_mask,
-                causal,
-                is_training,
-                dropout_rate=0.0,
-                name=None):
-    if is_training:
-        query_states, key_states, value_states = pre_process_for_sequence_parallel_attn(
-            query_states, key_states, value_states)
+@sequence_parallel_wrapper
+def flash_attn_w_mask(
+    query_states,  # bs, q_len, nhead, h_dim
+    key_states,
+    value_states,
+    attention_mask,
+    causal,
+    dropout_rate=0.0
+):
     batch_size, q_len = query_states.shape[:2]
     query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = upad_qkv(
         query_states, key_states, value_states, attention_mask, q_len)
-    # if is_training and dist.get_rank() == 0:
-    #     torch.save(query_states.cpu(), f'q_before_attn_sp{get_sequence_parallel_world_size()}.pth')
 
     cu_seqlens_q, cu_seqlens_k = cu_seq_lens
-    # print(cu_seqlens_q, cu_seqlens_k)
     max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
     attn_output_unpad = flash_attn_varlen_func(
         query_states,
@@ -177,31 +156,77 @@ def attn_w_mask(query_states,
         causal=causal,
     )
     attn_output = pad_input(attn_output_unpad, indices_q, batch_size, q_len)
-    # if is_training and 'layers.0' in name:
-    #     if dist.get_rank() == 0:
-    #         # torch.save(attn_output.cpu(), f'attn_sp{get_sequence_parallel_world_size()}.pth')
-    #         breakpoint()
-    # else:
-    #     import time
-    #     time.sleep(10000)
-
-    if is_training:
-        attn_output = post_process_for_sequence_parallel_attn(
-            attn_output).contiguous()
-    # if dist.get_rank() in range(4):
-    #     torch.save(attn_output.cpu(), f'attn_sp4_rank{dist.get_rank()}.pth')
-    # if dist.get_rank() == 0:
-    #     breakpoint()
     return attn_output
 
 
-def dist_varlen_attn(query_states, key_states, value_states, cumulative_len,
-                     max_seqlen):
-    # b, s, nd, dim
-    if get_sequence_parallel_world_size() > 1:
-        query_states, key_states, value_states = pre_process_for_sequence_parallel_attn(
-            query_states, key_states, value_states)
+# def attn_wo_mask(query_states,
+#                  key_states,
+#                  value_states,
+#                  causal,
+#                  is_training,
+#                  dropout_rate=0.0):
+#     if is_training:
+#         query_states, key_states, value_states = pre_process_for_sequence_parallel_attn(
+#             query_states, key_states, value_states)
+#     attn_output = flash_attn_func(
+#         query_states, key_states, value_states, dropout_rate, causal=causal)
+#     if is_training:
+#         attn_output = post_process_for_sequence_parallel_attn(
+#             attn_output).contiguous()
+#     return attn_output
 
+
+# def attn_w_mask(query_states,
+#                 key_states,
+#                 value_states,
+#                 attention_mask,
+#                 causal,
+#                 is_training,
+#                 dropout_rate=0.0):
+#     if is_training:
+#         query_states, key_states, value_states = pre_process_for_sequence_parallel_attn(
+#             query_states, key_states, value_states)
+#     batch_size, q_len = query_states.shape[:2]
+#     query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = upad_qkv(
+#         query_states, key_states, value_states, attention_mask, q_len)
+#     # if is_training and dist.get_rank() == 0:
+#     #     torch.save(query_states.cpu(), f'q_before_attn_sp{get_sequence_parallel_world_size()}.pth')
+
+#     cu_seqlens_q, cu_seqlens_k = cu_seq_lens
+#     # print(cu_seqlens_q, cu_seqlens_k)
+#     max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
+#     attn_output_unpad = flash_attn_varlen_func(
+#         query_states,
+#         key_states,
+#         value_states,
+#         cu_seqlens_q=cu_seqlens_q,
+#         cu_seqlens_k=cu_seqlens_k,
+#         max_seqlen_q=max_seqlen_in_batch_q,
+#         max_seqlen_k=max_seqlen_in_batch_k,
+#         dropout_p=dropout_rate,
+#         causal=causal,
+#     )
+#     attn_output = pad_input(attn_output_unpad, indices_q, batch_size, q_len)
+#     # if is_training and 'layers.0' in name:
+#     #     if dist.get_rank() == 0:
+#     #         # torch.save(attn_output.cpu(), f'attn_sp{get_sequence_parallel_world_size()}.pth')
+#     #         breakpoint()
+#     # else:
+#     #     import time
+#     #     time.sleep(10000)
+
+#     if is_training:
+#         attn_output = post_process_for_sequence_parallel_attn(
+#             attn_output).contiguous()
+#     # if dist.get_rank() in range(4):
+#     #     torch.save(attn_output.cpu(), f'attn_sp4_rank{dist.get_rank()}.pth')
+#     # if dist.get_rank() == 0:
+#     #     breakpoint()
+#     return attn_output
+
+@sequence_parallel_wrapper
+def varlen_flash_attn(query_states, key_states, value_states, cumulative_len,
+                     max_seqlen):
     q_unpad, k_unpad, v_unpad = query_states.flatten(0, 1), key_states.flatten(
         0, 1), value_states.flatten(0, 1)
     cumulative_len = torch.cat(cumulative_len, dim=0)
@@ -218,11 +243,37 @@ def dist_varlen_attn(query_states, key_states, value_states, cumulative_len,
         causal=True,
     )
     attn_output = attn_output.unsqueeze(0)
-
-    if get_sequence_parallel_world_size() > 1:
-        attn_output = post_process_for_sequence_parallel_attn(
-            attn_output).contiguous()
     return attn_output
+
+
+# def dist_varlen_attn(query_states, key_states, value_states, cumulative_len,
+#                      max_seqlen):
+#     # b, s, nd, dim
+#     if get_sequence_parallel_world_size() > 1:
+#         query_states, key_states, value_states = pre_process_for_sequence_parallel_attn(
+#             query_states, key_states, value_states)
+
+#     q_unpad, k_unpad, v_unpad = query_states.flatten(0, 1), key_states.flatten(
+#         0, 1), value_states.flatten(0, 1)
+#     cumulative_len = torch.cat(cumulative_len, dim=0)
+#     attn_output = flash_attn_varlen_func(
+#         q_unpad,
+#         k_unpad,
+#         v_unpad,
+#         cumulative_len,
+#         cumulative_len,
+#         max_seqlen,
+#         max_seqlen,
+#         0,
+#         return_attn_probs=False,
+#         causal=True,
+#     )
+#     attn_output = attn_output.unsqueeze(0)
+
+#     if get_sequence_parallel_world_size() > 1:
+#         attn_output = post_process_for_sequence_parallel_attn(
+#             attn_output).contiguous()
+#     return attn_output
 
 
 def internlm2_attn_forward(
@@ -289,22 +340,31 @@ def internlm2_attn_forward(
     causal = self.is_causal and q_len != 1
 
     if attention_mask is not None:
-        attn_output = attn_w_mask(
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            causal,
-            self.training,
-            name=self.name)
+        attn_output = flash_attn_w_mask(
+            query_states, key_states, value_states, attention_mask,
+            causal, training = self.training)
+
+        # attn_output = attn_w_mask(
+        #     query_states,
+        #     key_states,
+        #     value_states,
+        #     attention_mask,
+        #     causal,
+        #     self.training)
     else:
-        attn_output = attn_wo_mask(
+        attn_output = flash_attn_wo_mask(
             query_states,
             key_states,
             value_states,
             causal,
-            self.training,
-            name=self.name)
+            training = self.training)
+
+        # attn_output = attn_wo_mask(
+        #     query_states,
+        #     key_states,
+        #     value_states,
+        #     causal,
+        #     self.training)
 
     attn_output = attn_output.reshape(bsz, q_len,
                                       self.hidden_size).contiguous()
@@ -471,8 +531,10 @@ def internlm2_varlen_attn_forward(
 
     assert SUPPORT_FLASH2
     if is_training:
-        attn_output = dist_varlen_attn(query_states, key_states, value_states,
+        attn_output = varlen_flash_attn(query_states, key_states, value_states,
                                        cumulative_len, max_seqlen)
+        # attn_output = dist_varlen_attn(query_states, key_states, value_states,
+        #                                cumulative_len, max_seqlen)
     else:
         attn_output = flash_attn_func(
             query_states, key_states, value_states, causal=True)
