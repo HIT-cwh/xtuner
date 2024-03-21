@@ -59,6 +59,7 @@
    training/multi_modal_dataset.md
    training/open_source_dataset.md
    training/accelerate.md
+   training/training_extreme_long_sequence.md
 
 .. toctree::
    :maxdepth: 2
@@ -83,3 +84,13 @@
    :caption: 模型
 
    models/supported.md
+
+.. toctree::
+   :maxdepth: 2
+   :caption: InternEvo 迁移
+
+   internevo_migration/internevo_migration.md
+   internevo_migration/ftdp_dataset/Case1.md
+   internevo_migration/ftdp_dataset/Case2.md
+   internevo_migration/ftdp_dataset/Case3.md
+   internevo_migration/ftdp_dataset/Case4.md
