@@ -32,10 +32,12 @@ def openai_map_fn(example):
         elif msg['role'] == 'user':
             input += msg['content']
         elif msg['role'] == 'assistant':
+            output_with_loss = msg.get('loss', True) or False
             conversation.append({
                 'system': system,
                 'input': input,
-                'output': msg['content']
+                'output': msg['content'],
+                'output_with_loss': output_with_loss
             })
             system = ''
             input = ''
