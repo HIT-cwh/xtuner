@@ -342,6 +342,7 @@ def tokenize_and_save(tokenizer, processed_dir, tokenized_dir):
             print(f'{train_f} already exists, skip it')
             continue
 
+        print(f'tokenizing {file_path}...')
         tokenize_fun = partial(
             chatml_format,
             tokenizer=tokenizer,
@@ -355,9 +356,9 @@ def tokenize_and_save(tokenizer, processed_dir, tokenized_dir):
         for sample in track_progress_rich(
                 tokenize_fun,
                 dataset,
-                nproc=32,
+                nproc=16,
                 task_num=task_num,
-                chunksize=32,
+                chunksize=16,
                 description=f'{os.path.basename(file_path)}...'):
             samples.append(sample)
 

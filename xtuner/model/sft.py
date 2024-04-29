@@ -77,11 +77,13 @@ class SupervisedFinetune(BaseModel):
                  use_activation_checkpointing=True,
                  use_varlen_attn=False,
                  tokenizer=None,
-                 max_position_embeddings=None):
+                 max_position_embeddings=None,
+                 rope_theta=None):
         super().__init__()
         with LoadWoInit():
             if isinstance(llm, dict):
-                llm = self._dispatch_lm_model_cfg(llm, max_position_embeddings)
+                llm = self._dispatch_lm_model_cfg(llm, max_position_embeddings,
+                                                  rope_theta)
             self.llm = self._build_from_cfg_or_module(llm)
 
         if tokenizer is not None:
@@ -149,7 +151,8 @@ class SupervisedFinetune(BaseModel):
 
     @staticmethod
     def _prepare_for_long_context_training(cfg, llm_cfg,
-                                           max_position_embeddings):
+                                           max_position_embeddings,
+                                           rope_theta):
 
         orig_rope_scaling = getattr(llm_cfg, 'rope_scaling', None)
         if orig_rope_scaling is None:
@@ -167,6 +170,9 @@ class SupervisedFinetune(BaseModel):
                     'type': 'linear',
                     'factor': scaling_factor
                 }
+
+        if rope_theta is not None:
+            llm_cfg.rope_theta = rope_theta
 
         # hardcode for internlm2
         llm_cfg.attn_implementation = 'flash_attention_2'
@@ -203,14 +209,17 @@ class SupervisedFinetune(BaseModel):
 
         return cfg, llm_cfg
 
-    def _dispatch_lm_model_cfg(self, cfg, max_position_embeddings=None):
+    def _dispatch_lm_model_cfg(self,
+                               cfg,
+                               max_position_embeddings=None,
+                               rope_theta=None):
         pretrained_model_name_or_path = cfg.pretrained_model_name_or_path
         llm_cfg = AutoConfig.from_pretrained(
             pretrained_model_name_or_path, trust_remote_code=True)
         cfg, llm_cfg = self._prepare_for_flash_attn(cfg, llm_cfg)
         if max_position_embeddings is not None:
             cfg, llm_cfg = self._prepare_for_long_context_training(
-                cfg, llm_cfg, max_position_embeddings)
+                cfg, llm_cfg, max_position_embeddings, rope_theta)
         return cfg
 
     def _build_from_cfg_or_module(self, cfg_or_mod):

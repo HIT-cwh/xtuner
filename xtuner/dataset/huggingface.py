@@ -112,7 +112,8 @@ def process(dataset,
             use_varlen_attn=False,
             input_ids_with_output=True,
             with_image_token=False,
-            map_num_proc=32):
+            map_num_proc=32,
+            pack_num_proc=32):
     """Post-process the dataset loaded from the Hugging Face Hub, or a local
     dataset.
 
@@ -210,7 +211,7 @@ def process(dataset,
     # pack to max length
     if pack_to_max_length:
         dataset = pack_dataset(dataset, max_length, use_varlen_attn,
-                               shuffle_before_pack, map_num_proc)
+                               shuffle_before_pack, pack_num_proc)
 
     # add 'length'
     dataset = dataset.map(get_lengths, num_proc=map_num_proc)
@@ -234,7 +235,8 @@ def process_hf_dataset(dataset,
                        use_varlen_attn=False,
                        input_ids_with_output=True,
                        with_image_token=False,
-                       map_num_proc=32):
+                       map_num_proc=32,
+                       pack_num_proc=32):
     """Post-process the dataset loaded from the Hugging Face Hub, or a local
     dataset.
 
@@ -293,7 +295,8 @@ def process_hf_dataset(dataset,
         use_varlen_attn=use_varlen_attn,
         input_ids_with_output=input_ids_with_output,
         with_image_token=with_image_token,
-        map_num_proc=map_num_proc)
+        map_num_proc=map_num_proc,
+        pack_num_proc=pack_num_proc)
     if not (dist.is_available() and dist.is_initialized()):
         return process(**kwargs)
 
