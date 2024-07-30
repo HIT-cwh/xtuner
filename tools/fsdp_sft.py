@@ -298,7 +298,10 @@ def map_meta_modules(model, meta_model):
 def build_llm_model(args, config, world_size, dtype=torch.float32):
     with LoadWoInit():
         llm = AutoModelForCausalLM.from_pretrained(
-            args.llm, config=config, trust_remote_code=True)
+            args.llm,
+            config=config,
+            trust_remote_code=True,
+            attn_implementation=config.attn_implementation)
 
     # Ensure all numerical values in the optimizer are fp32.
     # FSDP will use low precision during forward.
@@ -668,6 +671,7 @@ def sft(args):
     max_memory = torch.cuda.max_memory_allocated()
     logger.info('[Train] Begin Train Loop. The current GPU memory is '
                 f'{(max_memory / 1024**3):.1f}GB')
+    # shard_llm.train()
     for step in range(start_step, total_steps):
 
         epoch = step // steps_per_epoch
