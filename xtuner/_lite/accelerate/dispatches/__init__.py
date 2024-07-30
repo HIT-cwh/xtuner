@@ -30,10 +30,19 @@ def dispatch_rms_norm_forward(module):
     return rms_norm_forward.__name__
 
 
+def dispatch_dsv2_varlen_attn_forward(module):
+    assert module.__class__.__name__ == 'DeepseekV2FlashAttention2'
+    from .dsv2 import deepseek_varlen_attn_forward
+    _dispatch_forward_fn(module, deepseek_varlen_attn_forward)
+    return deepseek_varlen_attn_forward.__name__
+
+
 DISPATCH_MAP = {
     'InternLM2FlashAttention2': dispatch_internlm_varlen_attn_forward,
+    'DeepseekV2FlashAttention2': dispatch_dsv2_varlen_attn_forward,
     'CLIPAttention': dispatch_clip_attn_forward,
-    'InternLM2RMSNorm': dispatch_rms_norm_forward
+    'InternLM2RMSNorm': dispatch_rms_norm_forward,
+    'DeepseekV2RMSNorm': dispatch_rms_norm_forward,
 }
 
 

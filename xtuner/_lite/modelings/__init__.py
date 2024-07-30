@@ -1,3 +1,4 @@
+from .deepseek_v2 import DeepseekV2Config, DeepseekV2ForCausalLM
 from .internlm2 import InternLM2Config, InternLM2ForCausalLM
 
 
