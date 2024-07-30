@@ -138,6 +138,66 @@ def dp_tp_lazy_init(module, module_map, dp_mesh, tp_mesh):
             buffer.data.copy_(b_copy)
 
 
+@torch.no_grad
+def ep_lazy_init(module, module_map, ep_mesh, experts_fsdp_mesh):
+
+    device = torch.cuda.current_device()
+    module.to_empty(device=torch.cuda.current_device(), recurse=False)
+
+    if experts_fsdp_mesh.get_local_rank() != 0:
+        return
+
+    if dist.get_rank() == 0:
+        master_module = module_map[module]
+        master_params = {
+            name: param
+            for name, param in master_module.named_parameters(recurse=False)
+        }
+        master_buffers = {
+            name: buffer
+            for name, buffer in master_module.named_buffers(recurse=False)
+        }
+    else:
+        master_params = None
+        master_buffers = None
+
+    for name, param in module.named_parameters(recurse=False):
+        if isinstance(param, DTensor):
+            if ep_mesh.get_local_rank() == 0:
+                p_copy = master_params[name]
+                p_copy = p_copy.to(device).to(param.dtype)
+            else:
+                p_copy = torch.empty(
+                    param.shape, dtype=param.dtype, device=device)
+
+            mesh = param.device_mesh
+            placements = param.placements
+
+            p_dtensor = distribute_tensor(p_copy, mesh, placements)
+            param.data.copy_(p_dtensor)
+        else:
+            if ep_mesh.get_local_rank() == 0:
+                p_copy = master_params[name]
+                p_copy = p_copy.to(device).to(param.dtype)
+            else:
+                p_copy = torch.empty_like(param)
+
+            ep_group = ep_mesh.get_group()
+            torch.distributed.broadcast(p_copy, 0, ep_group)
+            param.data.copy_(p_copy)
+
+    for name, buffer in module.named_buffers(recurse=False):
+        if ep_mesh.get_local_rank() == 0:
+            b_copy = master_buffers[name]
+            b_copy = b_copy.to(device).to(buffer.dtype)
+        else:
+            b_copy = torch.empty_like(buffer)
+
+        ep_group = ep_mesh.get_group()
+        torch.distributed.broadcast(b_copy, 0, ep_group)
+        buffer.data.copy_(b_copy)
+
+
 class LoadWoInit:
     """Context manager that disable parameter initialization."""
 
