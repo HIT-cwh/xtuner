@@ -26,11 +26,14 @@ def load_json(file):
 
 
 def load_jsonl(file):
-    dset = []
-    with open(file) as f:
-        for line in f:
-            # dset.append(line)
-            dset.append(json.loads(line))
+    try:
+        dset = []
+        with open(file) as f:
+            for line in f:
+                dset.append(json.loads(line))
+    except json.JSONDecodeError:
+        dset = load_json(file)
+
     return dset
 
 
