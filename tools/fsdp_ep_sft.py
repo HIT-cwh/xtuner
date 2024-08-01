@@ -30,7 +30,8 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision
 from torch.distributed.fsdp.api import CPUOffload, ShardingStrategy
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
-from torch.distributed.fsdp.wrap import _or_policy
+from torch.distributed.fsdp.wrap import (_or_policy,
+                                         transformer_auto_wrap_policy)
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 from torch.utils.data import ConcatDataset, DataLoader
@@ -615,6 +616,7 @@ def sft(args):
     logger.info('after barrier')
 
     decoder_layer_name = type(meta_llm.model.layers[0]).__name__
+    layer_type = type(meta_llm.model.layers[0])
 
     param_init_fn = partial(
         ep_lazy_init,
@@ -649,7 +651,9 @@ def sft(args):
         device_mesh=fsdp_device_mesh,
         sharding_strategy=strategy,
         cpu_offload=CPUOffload(offload_params=args.cpu_offload),
-        auto_wrap_policy=partial(_or_policy, policies=policies),
+        # auto_wrap_policy=partial(_or_policy, policies=policies),
+        auto_wrap_policy=partial(
+            transformer_auto_wrap_policy, transformer_layer_cls={layer_type}),
         mixed_precision=MixedPrecision(
             param_dtype=dtype, reduce_dtype=dtype, buffer_dtype=dtype),
         device_id=torch.cuda.current_device(),
@@ -760,6 +764,7 @@ def sft(args):
         step_data_time = 0
         step_start_t = time.time()
         step_consumed_tokens = 0
+        torch.cuda.empty_cache()
         for _ in range(iters_per_step):
             _data_start_t = time.time()
             data = next(data_iterator)

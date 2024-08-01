@@ -448,6 +448,7 @@ class MoEGate(nn.Module):
             topk_weight, topk_idx = torch.topk(
                 scores, k=self.top_k, dim=-1, sorted=False)
         elif self.topk_method == 'group_limited_greedy':
+            # Device-Limited Routing
             group_scores = (scores.view(bsz * seq_len, self.n_group,
                                         -1).max(dim=-1).values)  # [n, n_group]
             group_idx = torch.topk(
