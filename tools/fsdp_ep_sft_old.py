@@ -66,11 +66,6 @@ from xtuner._lite.parallel import (
     get_ep_mesh, get_ep_world_size, get_experts_fsdp_mesh, get_sp_group,
     get_sp_mesh, get_sp_world_size, reduce_sequence_parallel_loss,
     setup_parallel, split_for_sequence_parallel)
-from xtuner.model.transformers_models import (DeepseekV2Config,
-                                              DeepseekV2ForCausalLM)
-from xtuner.model.transformers_models.deepseek_v2.modeling_deepseek import \
-    DeepseekV2DecoderLayer
-from xtuner.model.utils import LoadWoInit
 from xtuner.utils import get_origin_state_dict
 
 # from torch.profiler import profile, record_function, ProfilerActivity
