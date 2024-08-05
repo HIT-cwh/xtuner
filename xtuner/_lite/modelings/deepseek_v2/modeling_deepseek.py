@@ -915,6 +915,8 @@ class DeepseekV2MoEEp(nn.Module):
                 sorted_tokens, get_ep_group(),
                 (tokens_per_expert_group.sum(dim=0).cpu().item(),
                  sorted_tokens.shape[1]), input_split_sizes, output_splits)
+            # if dist.get_rank() == 0:
+            #     print(gathered_tokens.shape, sorted_tokens.shape)
 
             # (experts_per_rank, ) 当前ep rank负责的expert，每个expert要处理多少tokens
             tokens_per_expert_post_gather = tokens_per_expert_group.view(
@@ -948,6 +950,128 @@ class DeepseekV2MoEEp(nn.Module):
 
         new_x = torch.empty_like(outs)
         new_x[idxs] = outs
+        final_out = (
+            new_x.view(*topk_ids.shape, -1).type(topk_weight.dtype).mul_(
+                topk_weight.unsqueeze(dim=-1)).sum(dim=1).type(new_x.dtype))
+        return final_out
+
+    def moe_forward_opt(self, x, topk_ids, topk_weight):
+        n_routed_experts = self.config.n_routed_experts
+        ep_size = self.ep_size
+        seq_len, topk = topk_ids.shape
+        dim = x.shape[-1]
+
+        experts_per_rank = n_routed_experts // ep_size
+        cnts = topk_ids.new_zeros(
+            (topk_ids.shape[0], n_routed_experts))  # (s, n_routed_experts)
+        cnts.scatter_(1, topk_ids,
+                      1)  # (s, n_routed_experts) 1的地方是当前token被哪几个expert算
+        tokens_per_expert = cnts.sum(dim=0)  # (n_routed_experts, )
+        idxs_ori = topk_ids.view(-1).argsort()  # 排序后的topk_ids原来的位置
+        # idxs // topk_ids.shape[1] 表示按照所属expert排序后的tokens，是第几个token
+        # 需要从x中slice出来
+        idxs = idxs_ori // topk_ids.shape[1]
+
+        tokens_per_ep_rank = tokens_per_expert.view(ep_size, -1).sum(-1)
+        start, end = 0, None
+        # unique_tokens = []
+        unique_idxs, inverse_idxs, uni_tokens_per_ep_rank = [], [], []
+
+        # cnt = 0
+        for i in tokens_per_ep_rank:
+            end = start + i
+            idx, inv_idx = torch.unique(idxs[start:end], return_inverse=True)
+            # cnt += idx.shape[0]
+            # unique_tokens.append(x[idx])
+            unique_idxs.append(idx)
+            inverse_idxs.append(inv_idx)
+            uni_tokens_per_ep_rank.append(len(idx))
+            start = end
+        unique_tokens = x.new_empty((sum(uni_tokens_per_ep_rank), x.shape[-1]))
+        start = 0
+        for idx in unique_idxs:
+            out = x[idx]
+            end = start + out.shape[0]
+            unique_tokens[start:end] = out
+            start = end
+
+        # r0 [6, 6] r1 [8, 6]
+        uni_tokens_per_ep_rank = torch.tensor(uni_tokens_per_ep_rank).cuda()
+
+        uni_tokens_per_expert_group = torch.empty_like(uni_tokens_per_ep_rank)
+        # r0 [6, 8] r1 [6, 6]
+        dist.all_to_all_single(
+            uni_tokens_per_expert_group,
+            uni_tokens_per_ep_rank,
+            group=get_ep_group())
+
+        # 通信有重复的token数
+        tokens_per_expert_group = torch.empty_like(tokens_per_expert)
+        # r0 [4, 4, 6, 4] r1 [4, 4, 4, 2]
+        dist.all_to_all_single(
+            tokens_per_expert_group, tokens_per_expert, group=get_ep_group())
+
+        inverse_idxs_per_expert_group = [
+            tokens_per_expert_group.new_empty(i)
+            for i in tokens_per_expert_group.view(ep_size, -1).sum(-1)
+        ]
+        # [tensor([0, 1, 2, 4, 0, 3, 4, 5], device='cuda:0'), tensor([0, 2, 3, 4, 6, 7, 1, 4, 5, 6], device='cuda:0')]
+        dist.all_to_all(
+            inverse_idxs_per_expert_group, inverse_idxs, group=get_ep_group())
+        acc_len = 0
+        # 方便将通信后的unique_tokens作为一个整体 reindex
+        for i in range(ep_size):
+            inverse_idxs_per_expert_group[i] += acc_len
+            acc_len += uni_tokens_per_expert_group[i]
+        inverse_idxs_per_expert_group = torch.cat(
+            inverse_idxs_per_expert_group)
+
+        input_split_size = uni_tokens_per_ep_rank.cpu().tolist()
+        output_split_size = uni_tokens_per_expert_group.cpu().tolist()
+        target_shape = (uni_tokens_per_expert_group.sum(), x.shape[1])
+        # output = unique_tokens[0].new_empty(target_shape)
+        # input_list = [t.contiguous() for t in unique_tokens]
+        # output_list = [t for t in output.split(output_split_size)]
+        # dist.all_to_all(output_list, input_list)
+        # unique_tokens = torch.cat(unique_tokens, dim=0)
+        output = all_to_all(unique_tokens, get_ep_group(), target_shape,
+                            input_split_size, output_split_size)
+        # output = all_to_all_opt(unique_tokens, get_ep_group(), target_shape, input_split_size, output_split_size)
+
+        # gathered_tokens = all_to_all()
+        gathered_tokens = output[inverse_idxs_per_expert_group]
+        # if dist.get_rank() == 0:
+        #     print(output.shape, gathered_tokens.shape)
+        # gatherd_idxs = np.zeros(shape=(gathered_tokens.shape[0], ), dtype=np.int32)
+        gatherd_idxs = torch.zeros(gathered_tokens.shape[0], dtype=torch.int32)
+        s = 0
+        for i, k in enumerate(tokens_per_expert_group.cpu().numpy()):
+            gatherd_idxs[s:s + k] = i % experts_per_rank
+            s += k
+        gatherd_idxs = gatherd_idxs.argsort()
+        sorted_tokens = gathered_tokens[gatherd_idxs]
+        tokens_per_expert = tokens_per_expert_group.view(ep_size,
+                                                         -1).sum(dim=0)
+
+        outs = self.experts[0](sorted_tokens, tokens_per_expert)
+
+        new_x = torch.empty_like(outs)
+        # reindex
+        new_x[gatherd_idxs] = outs
+        input_split_size = tokens_per_expert_group.view(
+            self.ep_size, -1).sum(1).cpu().numpy().tolist()
+        output_split_size = tokens_per_ep_rank.cpu().numpy().tolist()
+        target_shape = (seq_len * topk, dim)
+        # output = new_x.new_empty(target_shape)
+        # input_list = [t.contiguous() for t in new_x.split(input_split_size)]
+        # output_list = [t for t in output.split(output_split_size)]
+        # dist.all_to_all(output_list, input_list)
+        outs = all_to_all(new_x, get_ep_group(), target_shape,
+                          input_split_size, output_split_size)
+        # outs = output
+
+        new_x = torch.empty_like(outs)
+        new_x[idxs_ori] = outs
         final_out = (
             new_x.view(*topk_ids.shape, -1).type(topk_weight.dtype).mul_(
                 topk_weight.unsqueeze(dim=-1)).sum(dim=1).type(new_x.dtype))
