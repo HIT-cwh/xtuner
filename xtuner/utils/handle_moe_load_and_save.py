@@ -57,7 +57,10 @@ def _get_merged_param_name(origin_param_name, expert_num_per_shard):
     return w1w3, w2
 
 
-def _merge_experts_weight(state_dict, expert_num_per_shard, order_mapping):
+def _merge_experts_weight(state_dict,
+                          expert_num_per_shard,
+                          order_mapping,
+                          trans_w=False):
     experts_name = [key for key in state_dict.keys() if '.experts.' in key]
     experts_name = sorted(experts_name, key=mix_sort)
     linear_num_per_expert = 3
@@ -89,14 +92,20 @@ def _merge_experts_weight(state_dict, expert_num_per_shard, order_mapping):
         merged_key_w1w3, merged_key_w2 = _get_merged_param_name(
             experts_name_cur[0], expert_num_per_shard)
         print_on_rank0(f'merged key {merged_key_w1w3}')
+        if trans_w:
+            w1w3 = w1w3.transpose(1, 2)
         state_dict[merged_key_w1w3] = w1w3
         print_on_rank0(f'merged key {merged_key_w2}')
+        if trans_w:
+            w2 = w2.transpose(1, 2)
         state_dict[merged_key_w2] = w2
 
     return
 
 
-def load_state_dict_into_model(model_to_load, pretrained_model_path):
+def load_state_dict_into_model(model_to_load,
+                               pretrained_model_path,
+                               trans_w=False):
 
     model_name = type(model_to_load).__name__
     if model_name not in SUPPORT_MODELS:
@@ -138,7 +147,7 @@ def load_state_dict_into_model(model_to_load, pretrained_model_path):
                 new_shard = load_state_dict(shard_file, is_quantized=False)
                 state_dict.update(new_shard)
                 _merge_experts_weight(state_dict, expert_num_per_shard,
-                                      order_mapping)
+                                      order_mapping, trans_w)
             params_to_gather.append(param)
             param_names.append(name)
         if len(params_to_gather) > 0:
@@ -194,7 +203,9 @@ def _get_origin_param_name(merged_param_name, expert_num_per_shard, is_w1w3,
     return origin_param_names
 
 
-def _split_param(merged_param, is_w1w3):
+def _split_param(merged_param, is_w1w3, trans_w=False):
+    if trans_w:
+        merged_param = merged_param.transpose(1, 2).contiguous()
     if is_w1w3:
         expert_num, _, hidden_dim = merged_param.shape
         merged_param = merged_param.view(expert_num * 2, -1, hidden_dim)
@@ -204,7 +215,7 @@ def _split_param(merged_param, is_w1w3):
         return torch.unbind(merged_param, dim=0)
 
 
-def get_origin_state_dict(state_dict, model):
+def get_origin_state_dict(state_dict, model, trans_w=False):
 
     model_name = type(model).__name__
     if model_name not in SUPPORT_MODELS:
@@ -225,7 +236,7 @@ def get_origin_state_dict(state_dict, model):
                                                     is_w1w3,
                                                     param_name_mapping)
         merged_param = state_dict.pop(expert_param_name)
-        origin_params = _split_param(merged_param, is_w1w3)
+        origin_params = _split_param(merged_param, is_w1w3, trans_w)
         assert len(origin_param_names) == len(origin_params)
         for name, param in zip(origin_param_names, origin_params):
             state_dict[name] = param

@@ -46,7 +46,7 @@ from xtuner._lite import AutoModelForCausalLM, AutoTokenizer, get_logger
 from xtuner._lite.accelerate import (LORA_TARGET_MAP, dispatch_modules,
                                      packed_sequence)
 # from xtuner._lite.accelerate import packed_sequence_fwd_and_bwd
-from xtuner._lite.chat import ChatTemplate
+from xtuner._lite.chat import CHAT_TEMPLATE_MAP, ChatTemplate
 # from xtuner._lite.datasets import FinetuneDataset
 from xtuner._lite.datasets import (OPENAI_FORMAT_MAP, SoftPackerForText,
                                    TextCollator, TextOnlineTokenizeDataset,
@@ -101,6 +101,11 @@ def parse_args():
     model_args.add_argument('-t', '--tokenizer', default=None)
     model_args.add_argument(
         '--selective-checkpointing', default=1.0, type=float)
+    model_args.add_argument(
+        '--chat-template',
+        choices=CHAT_TEMPLATE_MAP.keys(),
+        help=('repo id or local path of the tokenizer. '
+              'Defaults to the same as `model`'))
 
     data_args = parser.add_argument_group('data', 'Group 1 description')
     data_args.add_argument('--dataset', help='')
@@ -133,6 +138,51 @@ def parse_args():
               'be `max_length`; When `soft`, it will pack multiple  data '
               'into nearly `max_length` without truncating the data.'))
     data_args.add_argument('--group-by-length', action='store_true')
+    data_args.add_argument(
+        '--datasets',
+        nargs='*',
+        help=('repo id or local path or dir of the datasets. For repo ids, '
+              'the `dset-sources` needs to be appropriately set to '
+              '`modelscope` or `huggingface`. For local dir, all json and '
+              'jsonl files will be loaded by default. The type of loaded '
+              'files can be controlled by setting `dset-file-type`'))
+    data_args.add_argument(
+        '--dset-file-types',
+        nargs='*',
+        default=LOAD_FN_MAP.keys(),
+        choices=LOAD_FN_MAP.keys(),
+        help='the file type that needs to be loaded')
+    data_args.add_argument(
+        '--dset-sources',
+        nargs='*',
+        default=['local'],
+        choices=['local', 'huggingface', 'modelscope'],
+        help=('the source of each dataset; it can accept one or the same '
+              'number of args as the number of `datasets`, with one arg '
+              'indicating that all datasets come from the same source. '
+              '`local` represents the local path, `huggingface` represents '
+              'the open-source data in the Huggingface Hub, `modelscope` '
+              'indicates the open-source data in the Modelscope Hub.'))
+    data_args.add_argument(
+        '--dset-formats',
+        nargs='*',
+        default=['openai'],
+        help=('the format of each dataset; it can accept one or the same '
+              'number of args as the number of `datasets`, with one arg '
+              'indicating that all datasets are the same format.'))
+    data_args.add_argument(
+        '--dset-sample-ratios',
+        nargs='*',
+        default=[1.0],
+        help=('the sample ratio of each dataset; it can accept one or the '
+              'same number of args as the number of `datasets`, with one arg '
+              'indicating that all datasets use the same sample ratio.'))
+    data_args.add_argument(
+        '--num-proc',
+        type=int,
+        default=8,
+        help='how many subprocesses to use for data mapping.')
+    data_args.add_argument('--file-pattern', type=str, default=None)
 
     dist_args = parser.add_argument_group('dist', 'Group 1 description')
     dist_args.add_argument('--sp-size', type=int, default=1, help='')
@@ -189,7 +239,7 @@ def is_interval(step, total_steps, interval):
 def reduce_ep_grad(shard_model):
     ep_size = get_ep_world_size()
     for module in shard_model.modules():
-        if type(module).__name__ == 'ExpertEp':
+        if type(module).__name__ in ('ExpertEp', 'GroupedLinear'):
             if module.w1w3.grad is not None:
                 module.w1w3.grad.div_(ep_size)
             if module.w2.grad is not None:
@@ -199,7 +249,7 @@ def reduce_ep_grad(shard_model):
 def get_moe_blocks(model):
     moe_blocks = []
     for module in model.modules():
-        if type(module).__name__ == 'ExpertEp':
+        if type(module).__name__ in ('ExpertEp', 'GroupedLinear'):
             moe_blocks.append(module)
     return moe_blocks
 
@@ -258,7 +308,8 @@ def get_ep_state_dict(module,
             destination = hook_result
 
     if isinstance(module, FSDP) and type(
-            module._fsdp_wrapped_module).__name__ == 'ExpertEp':
+            module._fsdp_wrapped_module).__name__ in ('ExpertEp',
+                                                      'GroupedLinear'):
         if dist.get_rank() == 0:
             print(prefix, module)
         w1w3 = destination.pop(prefix + 'w1w3', None)
@@ -292,7 +343,8 @@ def save_hf_model(shard_model,
 
     if (not dist.is_initialized()) or dist.get_rank() == 0:
         assert isinstance(origin_model, PreTrainedModel)
-        state_dict = get_origin_state_dict(state_dict, origin_model)
+        state_dict = get_origin_state_dict(
+            state_dict, origin_model, trans_w=True)
         # todo: fix origin_model.config, delete ep related
         print(f'Saving LLM to {ckpt_dir}')
         origin_model.save_pretrained(ckpt_dir, state_dict=state_dict)
@@ -334,6 +386,45 @@ def sft(args):
                 TextTokenizeFunction.from_cache, max_length=args.max_length)
         _datasets = load_from_cache(args.dset_cache_dir, init_fn)
         dist.barrier()
+    else:
+        chat_template = CHAT_TEMPLATE_MAP[args.chat_template]
+        tokenize_fns = []
+        init_fns = []
+        for dset_format in args.dset_formats:
+            # If your data format is not in `SUPPORT_DATA_FORMATS`, you should
+            # redefine a `tokenize_fn`, defining how to convert a piece of raw
+            # data into tokenized data.
+            # The tokenized data must include `input_ids`, `labels``,
+            # and `num_tokens`.
+            tokenize_fn = TextTokenizeFunction(tokenizer, chat_template,
+                                               dset_format)
+
+            if args.dset_pack_level == 'soft':
+                init_fn = partial(
+                    SoftPackerForText, max_length=args.max_length)
+            elif args.dset_cache_dir:
+                init_fn = partial(
+                    TextTokenizedDataset, max_length=args.max_length)
+            else:
+                init_fn = partial(
+                    TextOnlineTokenizeDataset, tokenize_fn=tokenize_fn)
+                # Online tokenization is used when not using a pack dataset,
+                # saving startup time.
+                tokenize_fn = None
+
+            tokenize_fns.append(tokenize_fn)
+            init_fns.append(init_fn)
+
+        _datasets = load_datasets(
+            paths=args.datasets,
+            cache_dir=args.dset_cache_dir,
+            file_types=args.dset_file_types,
+            sources=args.dset_sources,
+            sample_ratios=args.dset_sample_ratios,
+            num_proc=args.num_proc,
+            map_fns=tokenize_fns,
+            init_fns=init_fns,
+            file_pattern=args.file_pattern)
 
     if (args.dset_pack_level or args.cache_dir) and rank == 0:
         # Only the tokenized datasets can count the number of tokens
@@ -356,7 +447,7 @@ def sft(args):
                                        args.global_batch_size)
     else:
         sampler = ParallelSampler(
-            train_dataset, dp_mesh, args.global_batch_size, shuffle=True)
+            train_dataset, dp_mesh, args.global_batch_size, shuffle=False)
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -437,7 +528,7 @@ def sft(args):
 
     def _apply_ep(module, device_mesh):
         for m in module.modules():
-            if type(m).__name__ == 'ExpertEp':
+            if type(m).__name__ in ('ExpertEp', 'GroupedLinear'):
                 w1w3 = nn.Parameter(
                     distribute_tensor(m.w1w3, ep_mesh, [Shard(0)]))
                 m.register_parameter('w1w3', w1w3)
@@ -553,7 +644,7 @@ def sft(args):
 
     experts = {}
     for name, module in model.named_modules():
-        if type(module).__name__ == 'ExpertEp':
+        if type(module).__name__ in ('ExpertEp', 'GroupedLinear'):
             experts[name] = module
 
     for name in experts.keys():
@@ -645,6 +736,7 @@ def sft(args):
 
     optimizer = AdamW(
         shard_model.parameters(),
+        fused=True,
         lr=args.lr,
         weight_decay=args.weight_decay,
         betas=(0.9, 0.95))
@@ -771,7 +863,8 @@ def sft(args):
                 loss = outputs.loss
                 scaled_loss = loss / iters_per_step_cur
                 scaled_loss.backward()
-                step_consumed_tokens += attention_mask.sum()
+                # step_consumed_tokens += attention_mask.sum()
+                step_consumed_tokens += input_ids.shape[1]
 
             step_losses.append(loss.item())
 
