@@ -1015,9 +1015,9 @@ class DeepseekV2MoEEpGMM(nn.Module):
                     self.expert_ids_per_ep_rank,
                     tokens_per_expert_group.ravel())
 
-            global_input_tokens, _ = all_to_all_new(
-                permutated_local_input_tokens, output_splits, input_splits,
-                get_ep_group())
+            global_input_tokens, _ = all_to_all(permutated_local_input_tokens,
+                                                output_splits, input_splits,
+                                                get_ep_group())
 
             if self.experts_per_rank > 1:
                 # 不同rank过来的相同expert计算的token在一起
@@ -1035,7 +1035,7 @@ class DeepseekV2MoEEpGMM(nn.Module):
                 # token_unpermutation
                 expert_output = grouped_gemm.ops.unpermute(
                     expert_output, reversed_global_input_permutation_mapping)
-            permutated_local_input_tokens, _ = all_to_all_new(
+            permutated_local_input_tokens, _ = all_to_all(
                 expert_output, input_splits, output_splits, get_ep_group())
         else:
             permutated_local_input_tokens = expert_output
