@@ -254,13 +254,13 @@ class SoftPackerForText(CacheDataset):
             labels.extend(label)
             num_tokens.append(_num_tokens)
 
-        # if len(input_ids) < self.max_length:
-        #     num_pad_tokens = self.max_length - len(input_ids)
-        #     input_ids.extend([DEFAULT_PAD_TOKEN_INDEX] * num_pad_tokens)
-        #     labels.extend([IGNORE_INDEX] * num_pad_tokens)
-        #     num_tokens.append(num_pad_tokens)
-        # else:
-        #     num_tokens.append(0)
+        if len(input_ids) < self.max_length:
+            num_pad_tokens = self.max_length - len(input_ids)
+            input_ids.extend([DEFAULT_PAD_TOKEN_INDEX] * num_pad_tokens)
+            labels.extend([IGNORE_INDEX] * num_pad_tokens)
+            num_tokens.append(num_pad_tokens)
+        else:
+            num_tokens.append(0)
 
         packed = {
             'input_ids': input_ids,

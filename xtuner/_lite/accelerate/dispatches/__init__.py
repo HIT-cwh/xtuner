@@ -42,7 +42,7 @@ DISPATCH_MAP = {
     'DeepseekV2FlashAttention2': dispatch_dsv2_varlen_attn_forward,
     'CLIPAttention': dispatch_clip_attn_forward,
     'InternLM2RMSNorm': dispatch_rms_norm_forward,
-    # 'DeepseekV2RMSNorm': dispatch_rms_norm_forward,
+    'DeepseekV2RMSNorm': dispatch_rms_norm_forward,
 }
 
 

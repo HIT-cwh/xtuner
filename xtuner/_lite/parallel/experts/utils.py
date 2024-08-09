@@ -70,7 +70,7 @@ def fsdp_moe_blocks(shard_model, experts, experts_fsdp_mesh, param_init_fn,
 def reduce_ep_grad(shard_model):
     ep_size = get_ep_world_size()
     for module in shard_model.modules():
-        if type(module).__name__ == 'ExpertEp':
+        if type(module).__name__ in ('ExpertEp', 'GroupedLinear'):
             if module.w1w3.grad is not None:
                 module.w1w3.grad.div_(ep_size)
             if module.w2.grad is not None:

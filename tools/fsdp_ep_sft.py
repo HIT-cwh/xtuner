@@ -24,14 +24,14 @@ from torch.distributed._tensor import Shard, distribute_tensor
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import \
     apply_activation_checkpointing
 from torch.distributed.checkpoint.state_dict import (StateDictOptions,
-                                                     get_state_dict)
+                                                     get_state_dict,
+                                                     set_state_dict)
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import CPUOffload
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import MixedPrecision
-from torch.distributed.fsdp.api import CPUOffload, ShardingStrategy
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
-from torch.distributed.fsdp.wrap import (_or_policy,
-                                         transformer_auto_wrap_policy)
+from torch.distributed.fsdp.wrap import _or_policy
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR
 from torch.utils.data import ConcatDataset, DataLoader
@@ -67,25 +67,11 @@ logger = get_logger()
 SUPPORT_DATA_FORMATS = OPENAI_FORMAT_MAP.keys()
 
 
-def log_format(rank, debug=False):
-
-    formatter = f'[XTuner][RANK {rank}]'
-    formatter += '[{time:YYYY-MM-DD HH:mm:ss}][<level>{level}</level>]'
-
-    if debug:
-        formatter += '[<cyan>{name}</cyan>:'
-        formatter += '<cyan>{function}</cyan>:'
-        formatter += '<cyan>{line}</cyan>]'
-
-    formatter += ' <level>{message}</level>'
-    return formatter
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description='Train LLM')
 
-    model_args = parser.add_argument_group('model', 'Model Related Settings')
-    model_args.add_argument('--llm', help='repo id or local path of the model')
+    model_args = parser.add_argument_group('model', 'Group 1 description')
+    model_args.add_argument('--llm', help='config file name or path.')
     model_args.add_argument(
         '-t',
         '--tokenizer',
@@ -126,7 +112,6 @@ def parse_args():
         help=("the dtype of the model forward. When set to 'auto', it will "
               'automatically determine whether bf16 is available, '
               'prioritizing the use of bf16.'))
-
     model_args.add_argument(
         '--selective-recompute',
         default=1.0,
@@ -135,16 +120,14 @@ def parse_args():
               'The maximum is 1; the larger the value, the less memory '
               'required for training. The default is 1, meaning all layers '
               'need to be re-computated.'))
+    model_args.add_argument('--cpu-offload', action='store_true', help=(''))
     model_args.add_argument(
         '--shard-strategy',
         default='full',
         choices=['full', 'hybrid'],
         help=('The sharding strategy to be used for distributed training.'))
-    model_args.add_argument('--cpu-offload', action='store_true', help=(''))
-    model_args.add_argument('--sp-size', type=int, default=1, help='')
-    model_args.add_argument('--ep-size', type=int, default=1, help='')
 
-    data_args = parser.add_argument_group('data', 'Dataset Related Settings')
+    data_args = parser.add_argument_group('data', 'Group 1 description')
     data_args.add_argument(
         '--datasets',
         nargs='*',
@@ -213,17 +196,21 @@ def parse_args():
     data_args.add_argument(
         '--num-workers',
         type=int,
-        default=0,
+        default=8,
         help='how many subprocesses to use for data loading.')
     data_args.add_argument(
         '--num-proc',
         type=int,
         default=8,
         help='how many subprocesses to use for data mapping.')
-    data_args.add_argument('--file-pattern', type=str, default=None)
     data_args.add_argument('--group-by-length', action='store_true')
+    data_args.add_argument('--file-pattern', type=str, default=None)
 
-    optim_args = parser.add_argument_group('optim', 'Optim Related Settings')
+    dist_args = parser.add_argument_group('dist', 'Group 1 description')
+    dist_args.add_argument('--sp-size', type=int, default=1, help='')
+    dist_args.add_argument('--ep-size', type=int, default=1, help='')
+
+    optim_args = parser.add_argument_group('optimizer', 'Group 1 description')
     optim_args.add_argument(
         '--mirco-batch-size',
         type=int,
@@ -234,11 +221,13 @@ def parse_args():
         type=int,
         default=16,
         help='batch size for each optimizer step')
-
     optim_args.add_argument(
-        '--lr', default=4e-5, type=float, help='learning rate.')
-    optim_args.add_argument(
-        '--lr-min', default=6e-6, type=float, help='min learning rate.')
+        '--lr',
+        '--learning-rate',
+        default=4e-5,
+        type=float,
+        help='the dir to save logs and models')
+    optim_args.add_argument('--lr-min', default=1.5e-6, type=float)
     optim_args.add_argument(
         '--wd', default=0.01, type=float, help='weight decay.')
     optim_args.add_argument(
@@ -256,7 +245,7 @@ def parse_args():
     parser.add_argument(
         '--work-dir',
         default='work_dirs',
-        help='the dir to save logs and checkpoints')
+        help='the dir to save logs and models')
     parser.add_argument(
         '--checkpoint-interval',
         default=-1,
@@ -271,15 +260,14 @@ def parse_args():
         help=('only model parameters are saved when saving a checkpoint. '
               'This can significantly reduce the size of checkpoint files, '
               'but the saved checkpoints cannot be resumed.'))
-    parser.add_argument(
-        '--log-interval', default=1, type=int, help='log interval')
+    parser.add_argument('--log-interval', default=1, type=int)
     parser.add_argument(
         '--resume',
         type=str,
         default=None,
         help='specify checkpoint path to be resumed from.')
     parser.add_argument(
-        '--seed', type=int, default=0, help='random seed for the training')
+        '--seed', type=int, default=0, help='Random seed for the training')
     parser.add_argument(
         '--debug', action='store_true', help='Set logger level to `DEBUG`')
     args = parser.parse_args()
@@ -317,12 +305,8 @@ def build_llm_model(args, config, ep_size, world_size, dtype=torch.float32):
             moe_implementation=moe_implementation,
             ep_size=ep_size,
             trust_remote_code=True,
-            torch_dtype=config.torch_dtype,
+            torch_dtype=dtype,
             attn_implementation=config.attn_implementation)
-        # llm = AutoModelForCausalLM.from_pretrained(
-        #     args.llm, config=config, trust_remote_code=True,
-        #     # attn_implementation='flash_attention_2'
-        #     )
 
     # Ensure all numerical values in the optimizer are fp32.
     # FSDP will use low precision during forward.
@@ -349,6 +333,21 @@ def build_llm_model(args, config, ep_size, world_size, dtype=torch.float32):
     return llm
 
 
+def log_format(rank, debug=False):
+
+    formatter = f'[XTuner][RANK {rank}]'
+    formatter += '[{time:YYYY-MM-DD HH:mm:ss}][<level>{level}</level>]'
+
+    if debug:
+        formatter += '[<cyan>{name}</cyan>:'
+        formatter += '<cyan>{function}</cyan>:'
+        formatter += '<cyan>{line}</cyan>]'
+
+    formatter += ' <level>{message}</level>'
+    return formatter
+
+
+@logger.catch
 def sft(args):
     ###########################################################################
     #                           1. Environment                                #
@@ -357,6 +356,7 @@ def sft(args):
     init_dist(dist_launcher)
     set_random_seed(args.seed)
 
+    rank = dist.get_rank()
     world_size = int(os.environ['WORLD_SIZE'])
     sp_size = args.sp_size
     ep_size = args.ep_size
@@ -386,18 +386,14 @@ def sft(args):
     # fsdp device mesh for other parts of the moe model
     fsdp_mesh = init_device_mesh('cuda', (world_size, ))
 
-    rank = dist.get_rank()
     timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-
     objects = [timestamp]
     dist.broadcast_object_list(objects, src=0)
     timestamp = objects[0]
-
     args.work_dir = os.path.join(args.work_dir, timestamp)
     mkdir_or_exist(args.work_dir)
 
     log_file = os.path.join(args.work_dir, f'rank{rank}.log')
-
     # Change the log format printed in the terminal
     lvl = 'DEBUG' if args.debug else 'INFO'
     logger.add(sys.stderr, level=lvl, format=log_format(rank, args.debug))
@@ -447,7 +443,6 @@ def sft(args):
                 TextTokenizeFunction.from_cache, max_length=args.max_length)
         _datasets = load_from_cache(args.dset_cache_dir, init_fn)
         dist.barrier()
-
     else:
         chat_template = CHAT_TEMPLATE_MAP[args.chat_template]
         tokenize_fns = []
@@ -488,9 +483,9 @@ def sft(args):
             init_fns=init_fns,
             file_pattern=args.file_pattern)
 
-    if (args.dset_pack_level or args.cache_dir) and rank == 0 and args.debug:
+    if (args.dset_pack_level or args.cache_dir) and rank == 0:
         # Only the tokenized datasets can count the number of tokens
-        num_tokens = sum(sum(dset.total_tokens) for dset in _datasets)
+        num_tokens = sum(dset.total_tokens for dset in _datasets)
         logger.debug(f'[Dataset] {num_tokens} tokens.')
 
     train_dataset = ConcatDataset(_datasets)
@@ -509,7 +504,7 @@ def sft(args):
                                        args.global_batch_size)
     else:
         sampler = ParallelSampler(
-            train_dataset, dp_mesh, args.global_batch_size, shuffle=False)
+            train_dataset, dp_mesh, args.global_batch_size, shuffle=True)
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -528,7 +523,6 @@ def sft(args):
         _decoded = tokenizer.batch_decode(_first_batch['input_ids'])
         logger.debug(f'[Dataloader] Training Batch:\n{_first_batch}')
         logger.debug(f'[Dataloader] Training Batch(Decoded):\n{_decoded}')
-    dist.barrier()
 
     load_data_cost_time = time.time() - start_load_data_t
     logger.info(f'[Dataset & Dataloader] Cost {load_data_cost_time:.2f}s')
@@ -569,58 +563,52 @@ def sft(args):
     llm_cfg.torch_dtype = dtype
 
     with torch.device('meta'):
-        # Ensure all numerical values in the optimizer are fp32.
-        # FSDP will use low precision during forward.
-        meta_llm = build_llm_model(
+        model = build_llm_model(
             args,
             llm_cfg,
             ep_size=ep_size,
             world_size=world_size,
             dtype=torch.float32)
 
-    if ep_size > 1:
-        # apply expert parallel
-        for module in meta_llm.modules():
-            if type(module).__name__ == 'ExpertEp':
+    def _apply_ep(module, device_mesh):
+        for m in module.modules():
+            if type(m).__name__ in ('ExpertEp', 'GroupedLinear'):
                 w1w3 = nn.Parameter(
-                    distribute_tensor(module.w1w3, ep_mesh, [Shard(0)]))
-                module.register_parameter('w1w3', w1w3)
-                w2 = nn.Parameter(
-                    distribute_tensor(module.w2, ep_mesh, [Shard(0)]))
-                module.register_parameter('w2', w2)
+                    distribute_tensor(m.w1w3, ep_mesh, [Shard(0)]))
+                m.register_parameter('w1w3', w1w3)
+                w2 = nn.Parameter(distribute_tensor(m.w2, ep_mesh, [Shard(0)]))
+                m.register_parameter('w2', w2)
 
+    _apply_ep(model, ep_mesh)
     if pack_batch:
-        dispatch_modules(meta_llm)
+        dispatch_modules(model)
 
-    # Only load parameters on rank 0 to avoid each rank repeatedly loading the
-    # same model into the CPU, wasting memory
-    # Only rank 0 need to load checkpoint, so we setup `monitored_barrier`
-    # to prevent nccl timeout.
     xtuner_load_timeout = timedelta(minutes=60)
     group_gloo = dist.new_group(backend='gloo', timeout=xtuner_load_timeout)
 
     if rank == 0:
         with torch.device('cpu'):
-            llm = build_llm_model(
+            master_model = build_llm_model(
                 args, llm_cfg, ep_size=1, world_size=world_size, dtype=dtype)
-        rank0_meta_llm = copy.deepcopy(meta_llm)
+
+        rank0_meta_llm = copy.deepcopy(master_model)
         if hasattr(rank0_meta_llm.config, 'moe_implementation'):
             del rank0_meta_llm.config.moe_implementation
         rank0_meta_llm.config.ep_size = 1
-        meta_llm_map = map_meta_modules(llm, meta_llm)
+        master_mod_map = map_meta_modules(master_model, model)
+
     else:
-        meta_llm_map = None
-        rank0_meta_llm = None
+        master_model = None
+        master_mod_map = None
 
     dist.monitored_barrier(group=group_gloo, timeout=xtuner_load_timeout)
     logger.info('after barrier')
 
-    decoder_layer_name = type(meta_llm.model.layers[0]).__name__
-    layer_type = type(meta_llm.model.layers[0])
+    decoder_layer_name = type(model.model.layers[0]).__name__
 
-    param_init_fn = partial(
+    lazy_param_init_fn = partial(
         ep_lazy_init,
-        module_map=meta_llm_map,
+        module_map=master_mod_map,
         ep_mesh=ep_mesh,
         experts_fsdp_mesh=experts_fsdp_mesh)
 
@@ -644,28 +632,27 @@ def sft(args):
     torch.cuda.reset_peak_memory_stats()
     print(f'before {torch.cuda.max_memory_allocated()/1e9}')
 
-    meta_llm, experts = del_moe_blocks(meta_llm, moe_block_name='ExpertEp')
+    model, experts = del_moe_blocks(model, moe_block_name='GroupedLinear')
 
-    shard_llm = FSDP(
-        meta_llm,
-        device_mesh=fsdp_device_mesh,
+    shard_model = FSDP(
+        model,
         sharding_strategy=strategy,
         cpu_offload=CPUOffload(offload_params=args.cpu_offload),
-        # auto_wrap_policy=partial(_or_policy, policies=policies),
-        auto_wrap_policy=partial(
-            transformer_auto_wrap_policy, transformer_layer_cls={layer_type}),
+        device_mesh=fsdp_device_mesh,
         mixed_precision=MixedPrecision(
             param_dtype=dtype, reduce_dtype=dtype, buffer_dtype=dtype),
         device_id=torch.cuda.current_device(),
         use_orig_params=True,
-        param_init_fn=param_init_fn,
+        param_init_fn=lazy_param_init_fn,
         sync_module_states=True,
-    )
+        auto_wrap_policy=partial(_or_policy, policies=policies))
+
     torch.cuda.reset_peak_memory_stats()
     print(f'after other {torch.cuda.max_memory_allocated()/1e9}')
 
-    shard_llm = fsdp_moe_blocks(shard_llm, experts, experts_fsdp_mesh,
-                                param_init_fn, dtype)
+    shard_model = fsdp_moe_blocks(shard_model, experts, experts_fsdp_mesh,
+                                  lazy_param_init_fn, torch.bfloat16)
+
     torch.cuda.reset_peak_memory_stats()
     print(f'after moe {torch.cuda.max_memory_allocated()/1e9}')
 
@@ -674,7 +661,7 @@ def sft(args):
             checkpoint_check_fn,
             target=(decoder_layer_name, ),
             selective=args.selective_recompute)
-        apply_activation_checkpointing(shard_llm, check_fn=check_fn)
+        apply_activation_checkpointing(shard_model, check_fn=check_fn)
 
     fsdp_cost_time = time.time() - start_model_t
     logger.info(f'[Model] Cost {fsdp_cost_time:.2f}s')
@@ -683,11 +670,14 @@ def sft(args):
     ###########################################################################
     #                      4. Optimizer & Scheduler                           #
     ###########################################################################
+
     requried_grad_params = [
-        param for param in shard_llm.parameters() if param.requires_grad
+        param for param in shard_model.parameters() if param.requires_grad
     ]
+
     optimizer = AdamW(
         requried_grad_params,
+        fused=True,
         lr=args.lr,
         weight_decay=args.wd,
         betas=(0.9, 0.95))
@@ -730,6 +720,38 @@ def sft(args):
     #                          5. Training                                    #
     ###########################################################################
 
+    if args.resume:
+
+        model_state_dict, optim_state_dict = get_state_dict(
+            shard_model, optimizer)
+        warump_state_dict = warmup_scheduler.state_dict()
+        cosine_state_dict = cosine_scheduler.state_dict()
+
+        state_dict = {
+            'model': model_state_dict,
+            'optimizer': optim_state_dict,
+            'step': start_step,
+            'total_steps': total_steps,
+            'warmup_scheduler': warmup_scheduler.state_dict(),
+            'cosine_scheduler': cosine_scheduler.state_dict()
+        }
+        reader = dcp.FileSystemReader(args.resume)
+        dcp.load(state_dict, reader)
+
+        if state_dict['total_steps'] != total_steps:
+            raise RuntimeError
+
+        set_state_dict(
+            shard_model,
+            optimizer,
+            model_state_dict=model_state_dict,
+            optim_state_dict=optim_state_dict)
+
+        warmup_scheduler.load_state_dict(warump_state_dict)
+        cosine_scheduler.load_state_dict(cosine_state_dict)
+
+        start_step = state_dict['step']
+
     start_train_t = time.time()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
@@ -737,7 +759,7 @@ def sft(args):
     logger.info('[Train] Begin Train Loop. The current GPU memory is '
                 f'{(max_memory / 1024**3):.1f}GB')
 
-    shard_llm.train()
+    shard_model.train()
     for step in range(start_step, total_steps):
 
         epoch = step // steps_per_epoch
@@ -750,6 +772,7 @@ def sft(args):
 
             train_dataloader.sampler.set_epoch(epoch, epoch_inner_step)
             data_iterator = iter(train_dataloader)
+            logger.info(f'Epoch {epoch + 1} Total Step {step + 1} starts!')
 
         if step < warmup_steps:
             warmup_scheduler.step()
@@ -764,8 +787,9 @@ def sft(args):
         step_data_time = 0
         step_start_t = time.time()
         step_consumed_tokens = 0
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
         for _ in range(iters_per_step):
+
             _data_start_t = time.time()
             data = next(data_iterator)
             step_data_time += time.time() - _data_start_t
@@ -787,25 +811,24 @@ def sft(args):
                     labels = split_for_sequence_parallel(
                         labels, dim=1, sp_group=sp_group)
 
-                outputs = shard_llm(
+                outputs = shard_model(
                     input_ids=input_ids,
                     labels=labels,
-                    attention_mask=attention_mask)
-
+                    attention_mask=attention_mask,
+                )
                 loss = outputs.loss
+
                 if get_sp_world_size() > 1:
                     tokens_cal_loss = (labels != -100).sum()
                     loss = reduce_sequence_parallel_loss(
                         loss, tokens_cal_loss, sp_group)
 
                 avg_iter_loss = loss / iters_per_step
-
                 if scaler and args.use_lora:
                     scaler.scale(avg_iter_loss).backward()
                 else:
                     avg_iter_loss.backward()
 
-            step_loss += avg_iter_loss.item()
             if args.dset_pack_level == 'soft':
                 # During a soft pack process, the data with a length that is
                 # still smaller than the max length after packing, will be
@@ -815,9 +838,11 @@ def sft(args):
                 ) / get_sp_world_size()
             else:
                 step_consumed_tokens += num_tokens.sum() / get_sp_world_size()
+            step_loss += avg_iter_loss.item()
 
-        reduce_ep_grad(shard_llm)
-        grad_norm = shard_llm.clip_grad_norm_(args.max_grad_norm)
+        reduce_ep_grad(shard_model)
+
+        grad_norm = shard_model.clip_grad_norm_(args.max_grad_norm)
         optimizer.step()
         optimizer.zero_grad()
 
@@ -827,12 +852,12 @@ def sft(args):
         tgs = int(step_consumed_tokens / step_time)
         max_memory = torch.cuda.max_memory_allocated()
         if is_interval(step, total_steps, args.log_interval):
-            logger.info(f'[Train] (Epoch {epoch + 1}) Step '
-                        f'{step + 1}/{total_steps}  '
+            # step_loss = sum(step_losses) / len(step_losses)
+            logger.info(f'(Epoch {epoch + 1}) Step {step+1}/{total_steps}  '
                         f'lr: {cur_lr:.6f}  loss: {step_loss:.3f}  '
                         f'grad_norm: {grad_norm:.2f}  '
                         f'max_memory: {(max_memory / 1024**3):.1f}GB  '
-                        f'text_tokens: {step_consumed_tokens}  '
+                        f'step_consumed_tokens: {step_consumed_tokens}  '
                         f'tgs: {tgs}  data_time: {step_data_time:.2f}s  '
                         f'time: {step_time:.2f}s  '
                         f'eta: {eta}')
@@ -850,8 +875,8 @@ def sft(args):
             hf_dir = os.path.join(work_dir, f'hf-{step+1:0{num_digits}}')
             _options = StateDictOptions(cpu_offload=True, full_state_dict=True)
 
-            saved_llm = copy.deepcopy(rank0_meta_llm)
-            save_hf_model(shard_llm, saved_llm, tokenizer, hf_dir)
+            saved_llm = copy.deepcopy(rank0_meta_llm) if rank == 0 else None
+            save_hf_model(shard_model, saved_llm, tokenizer, hf_dir)
 
             if args.checkpoint_drop_optimizer:
                 logger.warning('The saved checkpoint cannot be resumed. '
@@ -865,7 +890,7 @@ def sft(args):
                     cpu_offload=True, ignore_frozen_params=True)
                 (shard_model_state_dict,
                  shard_optimizer_state_dict) = get_state_dict(
-                     shard_llm, optimizer, options=_options)
+                     shard_model, optimizer, options=_options)
 
                 state_dict = {
                     'model': shard_model_state_dict,

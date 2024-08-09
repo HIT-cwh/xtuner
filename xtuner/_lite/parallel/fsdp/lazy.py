@@ -145,6 +145,7 @@ def ep_lazy_init(module, module_map, ep_mesh, experts_fsdp_mesh):
     module.to_empty(device=torch.cuda.current_device(), recurse=False)
 
     if experts_fsdp_mesh.get_local_rank() != 0:
+        torch.cuda.empty_cache()
         return
 
     if dist.get_rank() == 0:
@@ -196,6 +197,8 @@ def ep_lazy_init(module, module_map, ep_mesh, experts_fsdp_mesh):
         ep_group = ep_mesh.get_group()
         torch.distributed.broadcast(b_copy, 0, ep_group)
         buffer.data.copy_(b_copy)
+
+    torch.cuda.empty_cache()
 
 
 class LoadWoInit:

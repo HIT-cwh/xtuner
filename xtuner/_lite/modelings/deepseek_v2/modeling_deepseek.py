@@ -22,14 +22,17 @@ import math
 import os
 import types
 import warnings
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from torch import nn
+from torch import Tensor, nn
+from torch.distributed._tensor import (DTensor, Replicate, Shard,
+                                       distribute_tensor)
+from torch.distributed.device_mesh import init_device_mesh
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
@@ -51,9 +54,17 @@ from transformers.utils import (add_start_docstrings,
                                 replace_return_docstrings)
 from transformers.utils.import_utils import is_torch_fx_available
 
+from xtuner._lite.parallel import get_ep_group, get_ep_world_size
 # from xtuner.utils import load_state_dict_into_model
 from xtuner._lite.parallel.experts import load_state_dict_into_model
 from .configuration_deepseek import DeepseekV2Config
+
+try:
+    import grouped_gemm
+    from grouped_gemm.ops import gmm
+except ImportError:
+    gmm = None
+    group_gemm = None
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -753,54 +764,6 @@ class DeepseekV2MoE(nn.Module):
         return final_out
 
 
-from typing import Any, Tuple
-
-from torch import Tensor
-from torch.distributed._tensor import (DTensor, Replicate, Shard,
-                                       distribute_tensor)
-from torch.distributed.device_mesh import init_device_mesh
-
-from xtuner._lite.parallel import get_ep_group
-
-# from xtuner._lite.parallel.expert_parallel.setup_distributed import get_ep_group
-
-
-def _all_to_all(input: Tensor, group, target_shape, input_split_sizes,
-                output_split_sizes):
-    output = input.new_empty(target_shape)
-    input_list = [t.contiguous() for t in input.split(input_split_sizes)]
-    output_list = [t for t in output.split(output_split_sizes)]
-    dist.all_to_all(output_list, input_list, group=group)
-    return output
-
-
-class _AllToAll(torch.autograd.Function):
-
-    @staticmethod
-    def forward(ctx: Any, input: Tensor, ep_group, target_shape,
-                input_split_sizes, output_split_sizes):
-        ctx.input_shape = input.shape
-        ctx.ep_group = ep_group
-        ctx.backward_input_split_size = output_split_sizes
-        ctx.backward_output_split_size = input_split_sizes
-        output = _all_to_all(input, ep_group, target_shape, input_split_sizes,
-                             output_split_sizes)
-        return output
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: Tensor) -> Tuple:
-        grad_output = _all_to_all(grad_output, ctx.ep_group, ctx.input_shape,
-                                  ctx.backward_input_split_size,
-                                  ctx.backward_output_split_size)
-        return grad_output, None, None, None, None
-
-
-def all_to_all(input: Tensor, ep_group, target_shape, input_split_sizes,
-               output_split_sizes):
-    return _AllToAll.apply(input, ep_group, target_shape, input_split_sizes,
-                           output_split_sizes)
-
-
 class ExpertEp(nn.Module):
 
     def __init__(self, config, expert_in_one_shard=10, ep_size=1):
@@ -854,6 +817,252 @@ class ExpertEp(nn.Module):
         return outs
 
 
+class GroupedLinear(nn.Module):
+    """Vanilla Feed forward using Gmm/Bmm.
+
+    WP not supported.
+    """
+
+    def __init__(self, config, expert_in_one_shard=10, ep_size=1):
+        super().__init__()
+        hidden_dim = config.hidden_size
+        ffn_dim = config.moe_intermediate_size
+        w1w3 = torch.empty(expert_in_one_shard, hidden_dim, ffn_dim * 2)
+        w2 = torch.empty(expert_in_one_shard, ffn_dim, hidden_dim)
+
+        self.w1w3 = nn.Parameter(w1w3)
+        self.w2 = nn.Parameter(w2)
+        self.ep_size = ep_size
+
+        self.act = nn.SiLU()
+        self.expert_in_one_shard = expert_in_one_shard
+
+    def forward(self, x, tokens_per_expert=None):
+        assert self.training, 'GroupedLinear'
+        if self.ep_size > 1:
+            w1w3 = self.w1w3.to_local()
+            w2 = self.w2.to_local()
+        else:
+            w1w3 = self.w1w3
+            w2 = self.w2
+        assert x.dim() == 2
+        gate_up_out = gmm(x, w1w3, tokens_per_expert)
+        gate_out, up_out = gate_up_out.chunk(2, dim=-1)
+        gate_out = self.act(gate_out)
+        out = gate_out * up_out
+        out = gmm(out, w2, tokens_per_expert)
+        return out
+
+
+class _AllToAll(torch.autograd.Function):
+    """All to all communication."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        inputs: Tensor,
+        output_split_sizes=None,
+        input_split_sizes=None,
+        group: dist.ProcessGroup = None,
+        async_op=False,
+    ) -> Tensor:  # type: ignore
+
+        ctx.input_shape = inputs.shape
+        ctx.output_split_sizes = output_split_sizes
+        ctx.input_split_sizes = input_split_sizes
+        ctx.group = group
+
+        world_size = dist.get_world_size(group=group)
+        # Bypass the function if we are using only 1 GPU.
+        if world_size == 1:
+            return inputs, None
+
+        inputs = inputs.contiguous()
+        out = (
+            torch.empty_like(inputs) if output_split_sizes is None else
+            inputs.new_empty(size=[sum(output_split_sizes)] +
+                             list(inputs.size()[1:])))
+        handle = dist.all_to_all_single(
+            out,
+            inputs,
+            output_split_sizes=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+            group=group,
+            async_op=async_op,
+        )
+
+        # if async_op=False, handle will be None
+        return out, handle
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: Tensor, _) -> Tuple[None, Tensor]:
+        if ctx.needs_input_grad[0]:
+            # Bypass the function if we are using only 1 GPU.
+            world_size = dist.get_world_size(group=ctx.group)
+            if world_size == 1:
+                return grad_output, None, None, None, None
+
+            grad_output = grad_output.contiguous()
+            out = torch.empty(
+                ctx.input_shape,
+                device=grad_output.device,
+                dtype=grad_output.dtype)
+            dist.all_to_all_single(
+                out,
+                grad_output,
+                output_split_sizes=ctx.input_split_sizes,
+                input_split_sizes=ctx.output_split_sizes,
+                group=ctx.group,
+            )
+            return out, None, None, None, None
+        return None, None, None, None, None
+
+
+def all_to_all(x,
+               output_split_sizes=None,
+               input_split_sizes=None,
+               group=None,
+               async_op=False):
+    return _AllToAll.apply(x, output_split_sizes, input_split_sizes, group,
+                           async_op)
+
+
+class DeepseekV2MoEEpGMM(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.expert_in_one_shard = config.n_routed_experts
+        self.n_routed_experts = config.n_routed_experts
+        ep_size = config.ep_size
+        ep_group = get_ep_group()
+
+        if ep_size > 1:
+            self.ep_rank = dist.get_rank(group=ep_group)
+            self.ep_size = ep_size
+            self.experts_per_rank = config.n_routed_experts // ep_size
+            self.experts = nn.ModuleList(
+                [GroupedLinear(config, config.n_routed_experts, ep_size)])
+        else:
+            self.ep_rank = 0
+            self.ep_size = 1
+            self.experts_per_rank = config.n_routed_experts
+            self.experts = nn.ModuleList(
+                [GroupedLinear(config, config.n_routed_experts, ep_size)])
+        local_expert_indices_offset = self.ep_rank * self.experts_per_rank
+        self.local_expert_indices = [
+            local_expert_indices_offset + i
+            for i in range(self.experts_per_rank)
+        ]
+        self.expert_ids_per_ep_rank = torch.tensor(
+            [i % self.experts_per_rank for i in range(self.n_routed_experts)],
+            dtype=torch.int32,
+            device='cuda',
+        )
+
+        self.gate = MoEGate(config)
+        if config.n_shared_experts is not None:
+            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+            self.shared_experts = DeepseekV2MLP(
+                config=config, intermediate_size=intermediate_size)
+
+    def moe_forward(self, x, topk_ids, topk_weight):
+        # (e, )
+        tokens_per_expert = torch.histc(
+            topk_ids,
+            bins=self.n_routed_experts,
+            min=0,
+            max=self.n_routed_experts)
+
+        hiddden_shape_before_permute = x.shape
+        # permute output 相同 expert 的tokens在一起
+        permutated_local_input_tokens, reversed_local_input_permutation_mapping = grouped_gemm.ops.permute(
+            x, topk_ids.to(torch.int32), None)
+
+        if self.ep_size > 1:
+            # (ep, ) 某个device上的tokens，每个ep rank需要算多少
+            input_splits = (
+                tokens_per_expert.reshape(self.ep_size,
+                                          self.experts_per_rank).sum(dim=1).to(
+                                              torch.device('cpu')).numpy())
+
+            # (e, )
+            tokens_per_expert_group = tokens_per_expert.new_empty(
+                tokens_per_expert.shape[0])
+            # 每个ep rank负责的experts有多少个对应tokens (n_routed_experts, )
+            # (r0e0, r0e1, ..., r0ei-1, r1e0, r1e1, ..., r1ei-1, r2e0, ...)
+            dist.all_to_all_single(
+                tokens_per_expert_group,
+                tokens_per_expert,
+                group=get_ep_group())
+            # (r0e0, r0e1, ..., r0ei-1,
+            #  r1e0, r1e1, ..., r1ei-1,
+            tokens_per_expert_group = tokens_per_expert_group.view(
+                self.ep_size, -1)
+
+            # 当前 device 要算的，来自不同ep rank的tokens数
+            output_splits = (
+                tokens_per_expert_group.sum(dim=-1).to(
+                    torch.device('cpu')).numpy())
+            # (num_local_expert, )
+            num_tokens_per_local_expert = tokens_per_expert_group.sum(dim=0)
+            num_tokens_per_local_expert = num_tokens_per_local_expert.to(
+                torch.device('cpu'))
+
+            if self.experts_per_rank > 1:
+                global_input_tokens_local_experts_indices = torch.repeat_interleave(
+                    self.expert_ids_per_ep_rank,
+                    tokens_per_expert_group.ravel())
+
+            global_input_tokens, _ = all_to_all_new(
+                permutated_local_input_tokens, output_splits, input_splits,
+                get_ep_group())
+
+            if self.experts_per_rank > 1:
+                # 不同rank过来的相同expert计算的token在一起
+                global_input_tokens, reversed_global_input_permutation_mapping = grouped_gemm.ops.permute(
+                    global_input_tokens,
+                    global_input_tokens_local_experts_indices.to(torch.int32))
+        else:
+            num_tokens_per_local_expert = tokens_per_expert
+
+        expert_output = self.experts[0](
+            global_input_tokens, tokens_per_expert=num_tokens_per_local_expert)
+
+        if self.ep_size > 1:
+            if self.experts_per_rank > 1:
+                # token_unpermutation
+                expert_output = grouped_gemm.ops.unpermute(
+                    expert_output, reversed_global_input_permutation_mapping)
+            permutated_local_input_tokens, _ = all_to_all_new(
+                expert_output, input_splits, output_splits, get_ep_group())
+        else:
+            permutated_local_input_tokens = expert_output
+
+        output = grouped_gemm.ops.unpermute(
+            permutated_local_input_tokens,
+            reversed_local_input_permutation_mapping,
+            topk_weight.to(torch.float32),
+        )
+        assert output.dtype == torch.bfloat16
+        return output
+
+    def forward(self, hidden_states):
+        assert self.training, 'DeepseekV2MoEEpGMM'
+        identity = hidden_states
+        orig_shape = hidden_states.shape
+        # (s, topk)
+        topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        y = self.moe_forward(hidden_states, topk_idx,
+                             topk_weight).view(*orig_shape)
+        y = AddAuxiliaryLoss.apply(y, aux_loss)
+        if self.config.n_shared_experts is not None:
+            y = y + self.shared_experts(identity)
+        return y
+
+
 class DeepseekV2MoEEp(nn.Module):
 
     def __init__(self, config):
@@ -867,12 +1076,12 @@ class DeepseekV2MoEEp(nn.Module):
             self.ep_size = ep_size
             self.experts_per_rank = config.n_routed_experts // ep_size
             self.experts = nn.ModuleList(
-                [ExpertEp(config, config.n_routed_experts, ep_size)])
+                [GroupedLinear(config, config.n_routed_experts, ep_size)])
         else:
             self.ep_size = 1
             self.experts_per_rank = config.n_routed_experts
             self.experts = nn.ModuleList(
-                [ExpertEp(config, config.n_routed_experts, ep_size)])
+                [GroupedLinear(config, config.n_routed_experts, ep_size)])
 
         self.gate = MoEGate(config)
         if config.n_shared_experts is not None:
@@ -911,12 +1120,8 @@ class DeepseekV2MoEEp(nn.Module):
                                              -1).sum(1).cpu().numpy().tolist())
 
             input_split_sizes = tokens_per_ep_rank.cpu().numpy().tolist()
-            gathered_tokens = all_to_all(
-                sorted_tokens, get_ep_group(),
-                (tokens_per_expert_group.sum(dim=0).cpu().item(),
-                 sorted_tokens.shape[1]), input_split_sizes, output_splits)
-            # if dist.get_rank() == 0:
-            #     print(gathered_tokens.shape, sorted_tokens.shape)
+            gathered_tokens = all_to_all(sorted_tokens, output_splits,
+                                         input_split_sizes, get_ep_group())
 
             # (experts_per_rank, ) 当前ep rank负责的expert，每个expert要处理多少tokens
             tokens_per_expert_post_gather = tokens_per_expert_group.view(
@@ -934,7 +1139,7 @@ class DeepseekV2MoEEp(nn.Module):
             sorted_tokens = gathered_tokens[gatherd_idxs]
             # (experts_per_rank, ) 当前ep rank负责的expert，每个expert要处理多少tokens
             tokens_per_expert = tokens_per_expert_post_gather
-        tokens_per_expert = tokens_per_expert.cpu().numpy()
+        tokens_per_expert = tokens_per_expert.cpu()  #.numpy()
 
         outs = self.experts[0](sorted_tokens, tokens_per_expert)
 
@@ -942,136 +1147,13 @@ class DeepseekV2MoEEp(nn.Module):
             new_x = torch.empty_like(outs)
             # reindex
             new_x[gatherd_idxs] = outs
-            gathered_tokens = all_to_all(new_x, get_ep_group(),
-                                         sorted_tokens_shape, output_splits,
-                                         input_split_sizes)
+            gathered_tokens = all_to_all(new_x, input_split_sizes,
+                                         output_splits, get_ep_group())
             # (s*topk, dim)
             outs = gathered_tokens
 
         new_x = torch.empty_like(outs)
         new_x[idxs] = outs
-        final_out = (
-            new_x.view(*topk_ids.shape, -1).type(topk_weight.dtype).mul_(
-                topk_weight.unsqueeze(dim=-1)).sum(dim=1).type(new_x.dtype))
-        return final_out
-
-    def moe_forward_opt(self, x, topk_ids, topk_weight):
-        n_routed_experts = self.config.n_routed_experts
-        ep_size = self.ep_size
-        seq_len, topk = topk_ids.shape
-        dim = x.shape[-1]
-
-        experts_per_rank = n_routed_experts // ep_size
-        cnts = topk_ids.new_zeros(
-            (topk_ids.shape[0], n_routed_experts))  # (s, n_routed_experts)
-        cnts.scatter_(1, topk_ids,
-                      1)  # (s, n_routed_experts) 1的地方是当前token被哪几个expert算
-        tokens_per_expert = cnts.sum(dim=0)  # (n_routed_experts, )
-        idxs_ori = topk_ids.view(-1).argsort()  # 排序后的topk_ids原来的位置
-        # idxs // topk_ids.shape[1] 表示按照所属expert排序后的tokens，是第几个token
-        # 需要从x中slice出来
-        idxs = idxs_ori // topk_ids.shape[1]
-
-        tokens_per_ep_rank = tokens_per_expert.view(ep_size, -1).sum(-1)
-        start, end = 0, None
-        # unique_tokens = []
-        unique_idxs, inverse_idxs, uni_tokens_per_ep_rank = [], [], []
-
-        # cnt = 0
-        for i in tokens_per_ep_rank:
-            end = start + i
-            idx, inv_idx = torch.unique(idxs[start:end], return_inverse=True)
-            # cnt += idx.shape[0]
-            # unique_tokens.append(x[idx])
-            unique_idxs.append(idx)
-            inverse_idxs.append(inv_idx)
-            uni_tokens_per_ep_rank.append(len(idx))
-            start = end
-        unique_tokens = x.new_empty((sum(uni_tokens_per_ep_rank), x.shape[-1]))
-        start = 0
-        for idx in unique_idxs:
-            out = x[idx]
-            end = start + out.shape[0]
-            unique_tokens[start:end] = out
-            start = end
-
-        # r0 [6, 6] r1 [8, 6]
-        uni_tokens_per_ep_rank = torch.tensor(uni_tokens_per_ep_rank).cuda()
-
-        uni_tokens_per_expert_group = torch.empty_like(uni_tokens_per_ep_rank)
-        # r0 [6, 8] r1 [6, 6]
-        dist.all_to_all_single(
-            uni_tokens_per_expert_group,
-            uni_tokens_per_ep_rank,
-            group=get_ep_group())
-
-        # 通信有重复的token数
-        tokens_per_expert_group = torch.empty_like(tokens_per_expert)
-        # r0 [4, 4, 6, 4] r1 [4, 4, 4, 2]
-        dist.all_to_all_single(
-            tokens_per_expert_group, tokens_per_expert, group=get_ep_group())
-
-        inverse_idxs_per_expert_group = [
-            tokens_per_expert_group.new_empty(i)
-            for i in tokens_per_expert_group.view(ep_size, -1).sum(-1)
-        ]
-        # [tensor([0, 1, 2, 4, 0, 3, 4, 5], device='cuda:0'), tensor([0, 2, 3, 4, 6, 7, 1, 4, 5, 6], device='cuda:0')]
-        dist.all_to_all(
-            inverse_idxs_per_expert_group, inverse_idxs, group=get_ep_group())
-        acc_len = 0
-        # 方便将通信后的unique_tokens作为一个整体 reindex
-        for i in range(ep_size):
-            inverse_idxs_per_expert_group[i] += acc_len
-            acc_len += uni_tokens_per_expert_group[i]
-        inverse_idxs_per_expert_group = torch.cat(
-            inverse_idxs_per_expert_group)
-
-        input_split_size = uni_tokens_per_ep_rank.cpu().tolist()
-        output_split_size = uni_tokens_per_expert_group.cpu().tolist()
-        target_shape = (uni_tokens_per_expert_group.sum(), x.shape[1])
-        # output = unique_tokens[0].new_empty(target_shape)
-        # input_list = [t.contiguous() for t in unique_tokens]
-        # output_list = [t for t in output.split(output_split_size)]
-        # dist.all_to_all(output_list, input_list)
-        # unique_tokens = torch.cat(unique_tokens, dim=0)
-        output = all_to_all(unique_tokens, get_ep_group(), target_shape,
-                            input_split_size, output_split_size)
-        # output = all_to_all_opt(unique_tokens, get_ep_group(), target_shape, input_split_size, output_split_size)
-
-        # gathered_tokens = all_to_all()
-        gathered_tokens = output[inverse_idxs_per_expert_group]
-        # if dist.get_rank() == 0:
-        #     print(output.shape, gathered_tokens.shape)
-        # gatherd_idxs = np.zeros(shape=(gathered_tokens.shape[0], ), dtype=np.int32)
-        gatherd_idxs = torch.zeros(gathered_tokens.shape[0], dtype=torch.int32)
-        s = 0
-        for i, k in enumerate(tokens_per_expert_group.cpu().numpy()):
-            gatherd_idxs[s:s + k] = i % experts_per_rank
-            s += k
-        gatherd_idxs = gatherd_idxs.argsort()
-        sorted_tokens = gathered_tokens[gatherd_idxs]
-        tokens_per_expert = tokens_per_expert_group.view(ep_size,
-                                                         -1).sum(dim=0)
-
-        outs = self.experts[0](sorted_tokens, tokens_per_expert)
-
-        new_x = torch.empty_like(outs)
-        # reindex
-        new_x[gatherd_idxs] = outs
-        input_split_size = tokens_per_expert_group.view(
-            self.ep_size, -1).sum(1).cpu().numpy().tolist()
-        output_split_size = tokens_per_ep_rank.cpu().numpy().tolist()
-        target_shape = (seq_len * topk, dim)
-        # output = new_x.new_empty(target_shape)
-        # input_list = [t.contiguous() for t in new_x.split(input_split_size)]
-        # output_list = [t for t in output.split(output_split_size)]
-        # dist.all_to_all(output_list, input_list)
-        outs = all_to_all(new_x, get_ep_group(), target_shape,
-                          input_split_size, output_split_size)
-        # outs = output
-
-        new_x = torch.empty_like(outs)
-        new_x[idxs_ori] = outs
         final_out = (
             new_x.view(*topk_ids.shape, -1).type(topk_weight.dtype).mul_(
                 topk_weight.unsqueeze(dim=-1)).sum(dim=1).type(new_x.dtype))
@@ -1632,7 +1714,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         elif moe_implementation == 'shard':
             block = DeepseekV2MoEShard
         elif moe_implementation == 'ep':
-            block = DeepseekV2MoEEp
+            block = DeepseekV2MoEEpGMM
         else:
             raise NotImplementedError
 
@@ -1738,7 +1820,7 @@ def _load_pretrained_model(
         raise NotImplementedError
 
     folder = os.path.sep.join(resolved_archive_file[0].split(os.path.sep)[:-1])
-    error_msgs = load_state_dict_into_model(model, folder)
+    error_msgs = load_state_dict_into_model(model, folder, True)
     return model, [], [], [], None, error_msgs
 
 
