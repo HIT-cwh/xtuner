@@ -7,10 +7,16 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from mmengine import print_log
+from torch.distributed._tensor import DTensor, Replicate
+from torch.distributed.fsdp import FullStateDictConfig
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import StateDictType
 from transformers.integrations import is_deepspeed_zero3_enabled
-from transformers.modeling_utils import load_state_dict
+from transformers.modeling_utils import PreTrainedModel, load_state_dict
 from transformers.utils import (SAFE_WEIGHTS_INDEX_NAME, WEIGHTS_INDEX_NAME,
                                 is_safetensors_available)
+
+from ..comm import barrier
 
 SUPPORT_MODELS = (
     'DeepseekV2ForCausalLM',
@@ -30,7 +36,7 @@ PARAM_NAME_MAPPING = dict(
 
 
 def print_on_rank0(info):
-    if dist.get_rank() == 0:
+    if (not dist.is_initialized()) or dist.get_rank() == 0:
         print_log(info, 'current')
 
 
@@ -241,3 +247,103 @@ def get_origin_state_dict(state_dict, model, trans_w=False):
         for name, param in zip(origin_param_names, origin_params):
             state_dict[name] = param
     return state_dict
+
+
+def _save_to_state_dict(module,
+                        destination,
+                        prefix,
+                        keep_vars,
+                        save_dtype=torch.float16):
+    _EXTRA_STATE_KEY_SUFFIX = '_extra_state'
+    for name, param in module._parameters.items():
+        if param is not None:
+            destination[prefix +
+                        name] = param if keep_vars else param.detach().to(
+                            save_dtype)
+    for name, buf in module._buffers.items():
+        if buf is not None and name not in module._non_persistent_buffers_set:
+            destination[prefix + name] = buf if keep_vars else buf.detach().to(
+                save_dtype)
+    extra_state_key = prefix + _EXTRA_STATE_KEY_SUFFIX
+    if getattr(module.__class__, 'get_extra_state',
+               nn.Module.get_extra_state) is not nn.Module.get_extra_state:
+        destination[extra_state_key] = module.get_extra_state()
+
+
+def get_ep_state_dict(module,
+                      destination=None,
+                      prefix='',
+                      keep_vars=False,
+                      save_dtype=torch.float16):
+    if destination is None:
+        destination = OrderedDict()
+        destination._metadata = OrderedDict()
+
+    local_metadata = dict(version=module._version)
+    if hasattr(destination, '_metadata'):
+        destination._metadata[prefix[:-1]] = local_metadata
+
+    for hook in module._state_dict_pre_hooks.values():
+        hook(module, prefix, keep_vars)
+    _save_to_state_dict(module, destination, prefix, keep_vars, save_dtype)
+    for name, child in module._modules.items():
+        if child is not None:
+            get_ep_state_dict(
+                child,
+                destination=destination,
+                prefix=prefix + name + '.',
+                keep_vars=keep_vars,
+                save_dtype=save_dtype)
+    for hook in module._state_dict_hooks.values():
+        hook_result = hook(module, destination, prefix, local_metadata)
+        if hook_result is not None:
+            destination = hook_result
+
+    if isinstance(module, FSDP) and type(
+            module._fsdp_wrapped_module).__name__ in ('ExpertEp',
+                                                      'GroupedLinear'):
+        if dist.get_rank() == 0:
+            print(prefix, module)
+        w1w3 = destination.pop(prefix + 'w1w3', None)
+        if w1w3 is not None:
+            assert isinstance(w1w3, DTensor), f'prefix {prefix} {w1w3}'
+            w1w3 = w1w3.redistribute(
+                placements=(Replicate(), ), async_op=False).to_local()
+            if dist.get_rank() == 0:
+                destination[prefix + 'w1w3'] = w1w3.cpu()
+
+        w2 = destination.pop(prefix + 'w2', None)
+        if w2 is not None:
+            assert isinstance(w2, DTensor), f'prefix {prefix} {w2}'
+            w2 = w2.redistribute(
+                placements=(Replicate(), ), async_op=False).to_local()
+            if dist.get_rank() == 0:
+                destination[prefix + 'w2'] = w2.cpu()
+
+    return destination
+
+
+@torch.no_grad()
+def save_hf_model(shard_model,
+                  origin_model,
+                  tokenizer,
+                  ckpt_dir,
+                  save_dtype=torch.float16):
+    cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(shard_model, StateDictType.FULL_STATE_DICT, cfg):
+        state_dict = get_ep_state_dict(shard_model, save_dtype=save_dtype)
+
+    if (not dist.is_initialized()) or dist.get_rank() == 0:
+        assert isinstance(origin_model, PreTrainedModel)
+        config = shard_model.config
+        moe_implementation = getattr(config, 'moe_implementation', 'origin')
+        use_ep = moe_implementation == 'ep'
+        if use_ep:
+            state_dict = get_origin_state_dict(
+                state_dict, origin_model, trans_w=True)
+        print(f'Saving LLM to {ckpt_dir}')
+        origin_model.save_pretrained(ckpt_dir, state_dict=state_dict)
+        print(f'Saving LLM tokenizer to {ckpt_dir}')
+        tokenizer.save_pretrained(ckpt_dir)
+
+    barrier()

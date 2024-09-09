@@ -11,6 +11,32 @@ _SP_WORLD_SIZE = None
 _DP_WORLD_SIZE = None
 _TP_WORLD_SIZE = None
 
+_EP_MESH = None
+_EXPERTS_FSDP_MESH = None
+_EP_GROUP = None
+_EP_WORLD_SIZE = None
+
+
+def setup_ep(ep_size):
+    world_size = dist.get_world_size()
+    assert world_size % ep_size == 0
+    fsdp_size = world_size // ep_size
+
+    # faster in multi nodes
+    device_mesh = init_device_mesh(
+        'cuda', (fsdp_size, ep_size), mesh_dim_names=('fsdp', 'ep'))
+    # slower in multi nodes
+    # device_mesh = init_device_mesh('cuda', (ep_size, fsdp_size),
+    #   mesh_dim_names=('ep', 'fsdp'))
+
+    global _EP_MESH
+    global _EXPERTS_FSDP_MESH
+    _EP_MESH = device_mesh['ep']
+    _EXPERTS_FSDP_MESH = device_mesh['fsdp']
+
+    global _EP_GROUP
+    _EP_GROUP = device_mesh.get_group('ep')
+
 
 def setup_sp(sp_size):
     world_size = dist.get_world_size()
@@ -56,10 +82,13 @@ def setup_dp():
     _DP_GROUP = device_mesh.get_group('dp')
 
 
-def setup_parallel(sp_size=1, tp_size=1):
+def setup_parallel(sp_size=1, tp_size=1, ep_size=1):
     assert not (sp_size > 1 and tp_size > 1), \
         ('DeepSpeed Sequence Parallel can not be used with '
          'Megatron-LM Tensor Parallel')
+
+    # expert parallel does not affect the initialization of dp mesh
+    setup_ep(ep_size)
 
     if sp_size > 1:
         setup_sp(sp_size)
@@ -67,6 +96,29 @@ def setup_parallel(sp_size=1, tp_size=1):
         setup_tp(tp_size)
     else:
         setup_dp()
+
+
+def get_experts_fsdp_mesh():
+    return _EXPERTS_FSDP_MESH
+
+
+def get_ep_mesh():
+    return _EP_MESH
+
+
+def get_ep_group():
+    return _EP_GROUP
+
+
+def get_ep_world_size():
+    global _EP_WORLD_SIZE
+    if _EP_WORLD_SIZE is not None:
+        return _EP_WORLD_SIZE
+    if not dist.is_initialized() or (_EP_GROUP is None):
+        _EP_WORLD_SIZE = 1
+    else:
+        _EP_WORLD_SIZE = dist.get_world_size(_EP_GROUP)
+    return _EP_WORLD_SIZE
 
 
 def get_dp_mesh():

@@ -23,26 +23,6 @@ except ImportError:
     pass
 
 
-def rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., :x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb_intern(q,
-                                k,
-                                cos,
-                                sin,
-                                position_ids=None,
-                                unsqueeze_dim=1):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
 def deepseek_attn_forward(
     self,
     hidden_states: torch.Tensor,
@@ -96,18 +76,12 @@ def deepseek_attn_forward(
                                                        self.layer_idx)
 
     assert position_ids is not None, '`position_ids` should not be None.'
-    if type(self.rotary_emb).__name__ in (
-            'InternLM2RotaryEmbedding',
-            'InternLM2DynamicNTKScalingRotaryEmbedding'):
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        q_pe, k_pe = apply_rotary_pos_emb_intern(q_pe, k_pe, cos, sin)
+    if self.training:
+        cos, sin = self.rotary_emb(
+            value_states, seq_len=position_ids.max() + 1)
     else:
-        if self.training:
-            cos, sin = self.rotary_emb(
-                value_states, seq_len=position_ids.max() + 1)
-        else:
-            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+    q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
 
     query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
     query_states[:, :, :, :self.qk_nope_head_dim] = q_nope
@@ -241,18 +215,12 @@ def deepseek_varlen_attn_forward(
                                                        self.layer_idx)
 
     assert position_ids is not None, '`position_ids` should not be None.'
-    if type(self.rotary_emb).__name__ in (
-            'InternLM2RotaryEmbedding',
-            'InternLM2DynamicNTKScalingRotaryEmbedding'):
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        q_pe, k_pe = apply_rotary_pos_emb_intern(q_pe, k_pe, cos, sin)
+    if self.training:
+        cos, sin = self.rotary_emb(
+            value_states, seq_len=position_ids.max() + 1)
     else:
-        if self.training:
-            cos, sin = self.rotary_emb(
-                value_states, seq_len=position_ids.max() + 1)
-        else:
-            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+    q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
 
     query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
     query_states[:, :, :, :self.qk_nope_head_dim] = q_nope

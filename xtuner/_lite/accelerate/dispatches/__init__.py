@@ -53,6 +53,7 @@ def dispatch_dsv2_varlen_attn_forward(module):
 
 DISPATCH_MAP = {
     'InternLM2FlashAttention2': dispatch_internlm_varlen_attn_forward,
+    'DeepseekV2FlashAttention2': dispatch_dsv2_varlen_attn_forward,
     'CLIPAttention': dispatch_clip_attn_forward,
     'InternLM2RMSNorm': dispatch_rms_norm_forward,
     'LlamaFlashAttention2': dispatch_llama_varlen_attn_forward,
@@ -60,6 +61,7 @@ DISPATCH_MAP = {
     'Qwen2FlashAttention2': dispatch_qwen2_varlen_attn_forward,
     'Qwen2RMSNorm': dispatch_rms_norm_forward,
     'DeepseekV2FlashAttention2': dispatch_dsv2_varlen_attn_forward,
+    'DeepseekV2RMSNorm': dispatch_rms_norm_forward,
 }
 
 

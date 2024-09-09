@@ -5,7 +5,8 @@ from xtuner._lite import get_logger
 logger = get_logger()
 _LAYERS = [
     'InternLM2DecoderLayer', 'CLIPVisionModel', 'LlavaMultiModalProjector',
-    'LlamaDecoderLayer', 'Qwen2DecoderLayer', 'DeepseekV2DecoderLayer'
+    'LlamaDecoderLayer', 'Qwen2DecoderLayer', 'DeepseekV2DecoderLayer',
+    'DeepseekV2DecoderLayer'
 ]
 
 
