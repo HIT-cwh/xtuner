@@ -60,7 +60,6 @@ DISPATCH_MAP = {
     'LlamaRMSNorm': dispatch_rms_norm_forward,
     'Qwen2FlashAttention2': dispatch_qwen2_varlen_attn_forward,
     'Qwen2RMSNorm': dispatch_rms_norm_forward,
-    'DeepseekV2FlashAttention2': dispatch_dsv2_varlen_attn_forward,
     'DeepseekV2RMSNorm': dispatch_rms_norm_forward,
 }
 
