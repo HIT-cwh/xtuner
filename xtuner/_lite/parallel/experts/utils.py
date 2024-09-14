@@ -30,8 +30,8 @@ def del_moe_blocks(model, moe_block_name='ExpertEp'):
     return model, experts
 
 
-def fsdp_moe_blocks(shard_model, experts, experts_fsdp_mesh, param_init_fn,
-                    dtype):
+def fsdp_moe_blocks(shard_model, strategy, experts, experts_fsdp_mesh,
+                    param_init_fn, dtype):
     keys = list(experts.keys())
     for name in keys:
         expert = experts.pop(name)
@@ -42,7 +42,9 @@ def fsdp_moe_blocks(shard_model, experts, experts_fsdp_mesh, param_init_fn,
                        ] + splits[:3] + ['_fsdp_wrapped_module'] + splits[-2:]
         expert = FSDP(
             expert,
+            forward_prefetch=True,
             device_mesh=experts_fsdp_mesh,
+            sharding_strategy=strategy,
             mixed_precision=MixedPrecision(
                 param_dtype=dtype, reduce_dtype=dtype, buffer_dtype=dtype),
             device_id=torch.cuda.current_device(),
