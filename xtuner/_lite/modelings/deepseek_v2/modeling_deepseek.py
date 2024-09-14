@@ -839,7 +839,7 @@ class GroupedLinear(nn.Module):
 
     def forward(self, x, tokens_per_expert=None):
         assert self.training, 'GroupedLinear'
-        if self.ep_size > 1:
+        if isinstance(self.w1w3, DTensor):
             w1w3 = self.w1w3.to_local()
             w2 = self.w2.to_local()
         else:
@@ -1025,7 +1025,10 @@ class DeepseekV2MoEEpGMM(nn.Module):
                     global_input_tokens,
                     global_input_tokens_local_experts_indices.to(torch.int32))
         else:
+            global_input_tokens = permutated_local_input_tokens
             num_tokens_per_local_expert = tokens_per_expert
+            num_tokens_per_local_expert = num_tokens_per_local_expert.to(
+                torch.device('cpu'))
 
         expert_output = self.experts[0](
             global_input_tokens, tokens_per_expert=num_tokens_per_local_expert)
@@ -1051,6 +1054,8 @@ class DeepseekV2MoEEpGMM(nn.Module):
     def forward(self, hidden_states):
         assert self.training, 'DeepseekV2MoEEpGMM'
         identity = hidden_states
+        if self.config.n_shared_experts is not None:
+            z = self.shared_experts(identity)
         orig_shape = hidden_states.shape
         # (s, topk)
         topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
@@ -1058,8 +1063,7 @@ class DeepseekV2MoEEpGMM(nn.Module):
         y = self.moe_forward(hidden_states, topk_idx,
                              topk_weight).view(*orig_shape)
         y = AddAuxiliaryLoss.apply(y, aux_loss)
-        if self.config.n_shared_experts is not None:
-            y = y + self.shared_experts(identity)
+        y = y + z
         return y
 
 
@@ -1865,6 +1869,11 @@ class DeepseekV2PreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, GroupedLinear):
+            for data in module.w1w3.data:
+                data.normal_(mean=0.0, std=std)
+            for data in module.w2.data:
+                data.normal_(mean=0.0, std=std)
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
@@ -1982,6 +1991,10 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
+        try:
+            self.cuda()
+        except:
+            pass
         self.post_init()
 
     def get_input_embeddings(self):
