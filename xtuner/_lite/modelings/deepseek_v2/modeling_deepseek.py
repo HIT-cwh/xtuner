@@ -443,9 +443,12 @@ class MoEGate(nn.Module):
         bsz, seq_len, h = hidden_states.shape
         ### compute gating score
         hidden_states = hidden_states.view(-1, h)
+        if isinstance(self.weight, DTensor):
+            w = self.weight.to_local()
+        else:
+            w = self.weight
         logits = F.linear(
-            hidden_states.type(torch.float32), self.weight.type(torch.float32),
-            None)
+            hidden_states.type(torch.float32), w.type(torch.float32), None)
         if self.scoring_func == 'softmax':
             scores = logits.softmax(dim=-1, dtype=torch.float32)
         else:
@@ -838,6 +841,7 @@ class GroupedLinear(nn.Module):
         self.expert_in_one_shard = expert_in_one_shard
 
     def forward(self, x, tokens_per_expert=None):
+        tokens_per_expert = tokens_per_expert.cpu()
         assert self.training, 'GroupedLinear'
         if isinstance(self.w1w3, DTensor):
             w1w3 = self.w1w3.to_local()
@@ -1862,18 +1866,33 @@ class DeepseekV2PreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
+            device = module.weight.data.device
+            if device == torch.device('meta'):
+                return
+            module.cuda()
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
+            module.to(device)
         elif isinstance(module, nn.Embedding):
+            device = module.weight.data.device
+            if device == torch.device('meta'):
+                return
+            module.cuda()
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+            module.to(device)
         elif isinstance(module, GroupedLinear):
+            device = module.w1w3.data.device
+            if device == torch.device('meta'):
+                return
+            module.cuda()
             for data in module.w1w3.data:
                 data.normal_(mean=0.0, std=std)
             for data in module.w2.data:
                 data.normal_(mean=0.0, std=std)
+            module.to(device)
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
@@ -1991,10 +2010,7 @@ class DeepseekV2Model(DeepseekV2PreTrainedModel):
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
-        try:
-            self.cuda()
-        except:
-            pass
+
         self.post_init()
 
     def get_input_embeddings(self):
