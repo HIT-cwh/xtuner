@@ -124,8 +124,9 @@ def _internlm2_varlen_attn_forward(
     bsz, q_len, _ = hidden_states.size()
     attn_context = MessageHub.get_instance('packed_sequence')
 
-    position_ids = attn_context.get_info('position_ids')
-    assert position_ids.size(1) == q_len, f'{position_ids.size(1)} {q_len}'
+    if attn_context.get_info('position_ids') is not None:
+        position_ids = attn_context.get_info('position_ids')
+        assert position_ids.size(1) == q_len, f'{position_ids.size(1)} {q_len}'
 
     qkv_states = self.wqkv(hidden_states)
 
@@ -209,7 +210,9 @@ def _internlm2_varlen_attn_forward(
             causal=True,
             training=self.training)
 
-    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+    # attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+    # Support the case: hidden_size != hdim * nhead
+    attn_output = attn_output.reshape(bsz, q_len, -1)
 
     attn_output = self.wo(attn_output)
 
