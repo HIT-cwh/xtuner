@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import torch
+from torch.distributed._tensor import DTensor
 
 try:
     from flash_attn.ops.triton.layernorm import rms_norm_fn
@@ -21,6 +22,10 @@ def rms_norm_forward(self, hidden_states):
         raise RuntimeError(
             'Can not use triton kernels on cpu. Please set `USE_TRITON_KERNEL`'
             ' environment variable to 0 before training.')
-    ret = rms_norm_fn(
-        hidden_states, self.weight, None, eps=self.variance_epsilon)
+
+    if isinstance(self.weight, DTensor):
+        w = self.weight.to_local()
+    else:
+        w = self.weight
+    ret = rms_norm_fn(hidden_states, w, None, eps=self.variance_epsilon)
     return ret
