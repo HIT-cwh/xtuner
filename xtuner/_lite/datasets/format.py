@@ -47,6 +47,33 @@ class Alpaca2Openai():
             }
 
 
+class MathRM2Openai():
+
+    @staticmethod
+    def convert(data):
+        query = data['query']
+        output = data['output']
+
+        return {
+            'messages': [
+                {
+                    'role':
+                    'system',
+                    'content':
+                    'Please reason step by step, and put your final answer within \\boxed{}.'
+                },
+                {
+                    'role': 'user',
+                    'content': query
+                },
+                {
+                    'role': 'assistant',
+                    'content': output
+                },
+            ]
+        }
+
+
 def llava_to_openai(data):
 
     image_token = '<image>'
@@ -153,4 +180,5 @@ OPENAI_FORMAT_MAP = {
     'llava_interleave': llava_to_openai_interleave,
     'alpaca': Alpaca2Openai.convert,
     'openai': lambda x: x,
+    'mathrm': MathRM2Openai.convert,
 }

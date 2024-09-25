@@ -241,10 +241,13 @@ class SoftPackerForText(CacheDataset):
         input_ids = []
         labels = []
         num_tokens = []
+        content = []
         for i in packed_items:
             ids = dataset[i]['input_ids']
             label = dataset[i]['labels']
             _num_tokens = dataset[i]['num_tokens']
+            query = dataset[i]['query']
+            output = dataset[i]['output']
             if len(ids) > self.max_length:
                 ids = ids[:self.max_length]
                 label = label[:self.max_length]
@@ -253,6 +256,7 @@ class SoftPackerForText(CacheDataset):
             input_ids.extend(ids)
             labels.extend(label)
             num_tokens.append(_num_tokens)
+            content.append((query, output))
 
         if len(input_ids) < self.max_length:
             num_pad_tokens = self.max_length - len(input_ids)
@@ -266,6 +270,7 @@ class SoftPackerForText(CacheDataset):
             'input_ids': input_ids,
             'labels': labels,
             'num_tokens': num_tokens,
+            'content': content
         }
 
         if len(input_ids) != len(labels):
@@ -511,11 +516,13 @@ class TextCollator():
         input_ids = []
         labels = []
         num_tokens = []
+        contents = []
 
         for data in instances:
             input_ids.append(torch.LongTensor(data['input_ids']))
             labels.append(torch.LongTensor(data['labels']))
             num_tokens.extend(data['num_tokens'])
+            contents.extend(data['content'])
 
         attention_mask = [torch.ones_like(ids) for ids in input_ids]
         num_tokens = torch.IntTensor(num_tokens)
@@ -557,12 +564,14 @@ class TextCollator():
             raise RuntimeError('The shape of input_ids and labels must be '
                                f'equal, but  found {input_ids.shape} and '
                                f'{labels.shape}.')
+
         # TODO support sp
         data_dict = {
             'input_ids': input_ids,
             'labels': labels,
             'num_tokens': num_tokens,
-            'attention_mask': attention_mask.bool()
+            'attention_mask': attention_mask.bool(),
+            'content': contents
         }
 
         return data_dict

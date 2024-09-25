@@ -160,6 +160,13 @@ class ChatMessages(BaseMessages):
             'num_tokens': len(input_ids),
         }
 
+        assert len(self.messages) == 3
+        for msg in self.messages:
+            if msg.role == 'user':
+                training_data['query'] = msg.content
+            elif msg.role == 'assistant':
+                training_data['output'] = msg.content
+
         if len(image_urls) > 0:
             training_data['image_urls'] = image_urls
 
@@ -183,7 +190,6 @@ class ChatMessages(BaseMessages):
         }
         '''
         return cls(**item)
-        
 
 
 if __name__ == '__main__':
