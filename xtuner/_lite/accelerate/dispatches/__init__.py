@@ -1,6 +1,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import types
 
+import torch.distributed as dist
+
 from xtuner._lite import get_logger
 
 logger = get_logger()
@@ -72,5 +74,6 @@ def dispatch_modules(model, use_varlen_attn=False):
         module_cls = module.__class__.__name__
         if module_cls in DISPATCH_MAP:
             dispatched = DISPATCH_MAP[module_cls](module)
-            logger.info(
-                f'Dispatch {name}({module_cls}) forward to `{dispatched}`')
+            if dist.get_rank() == 0:
+                logger.info(
+                    f'Dispatch {name}({module_cls}) forward to `{dispatched}`')
