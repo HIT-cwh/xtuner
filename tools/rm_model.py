@@ -203,6 +203,7 @@ def parse_args():
         '--seed', type=int, default=0, help='random seed for the training')
     parser.add_argument(
         '--debug', action='store_true', help='Set logger level to `DEBUG`')
+    parser.add_argument('--output-file')
     args = parser.parse_args()
     return args
 
@@ -562,6 +563,7 @@ def sft(args):
     torch.cuda.reset_peak_memory_stats()
     shard_llm = FSDP(
         meta_llm,
+        forward_prefetch=True,
         device_mesh=fsdp_device_mesh,
         sharding_strategy=strategy,
         auto_wrap_policy=layer_auto_wrap_policy,
@@ -613,7 +615,7 @@ def sft(args):
         pooled_logits = outputs.logits
         assert pooled_logits.numel() == len(
             content), f'{pooled_logits.numel()} {len(content)}'
-        with open('qwen_rm_math.jsonl', 'a') as file:
+        with open(args.output_file, 'a') as file:
             for i, score in enumerate(pooled_logits.flatten().cpu().tolist()):
                 data = {
                     'query': content[i][0],
