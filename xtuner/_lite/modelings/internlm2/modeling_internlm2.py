@@ -256,17 +256,20 @@ class InternLM2Attention(nn.Module):
 
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
+        if config.head_dim is None:
+            self.head_dim = self.hidden_size // self.num_heads
+        else:
+            self.head_dim = config.head_dim
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = True
 
-        if (self.head_dim * self.num_heads) != self.hidden_size:
-            raise ValueError(
-                f'hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}'
-                f' and `num_heads`: {self.num_heads}).')
+        # if (self.head_dim * self.num_heads) != self.hidden_size:
+        #     raise ValueError(
+        #         f'hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}'
+        #         f' and `num_heads`: {self.num_heads}).')
 
         self.wqkv = nn.Linear(
             self.hidden_size,
@@ -869,13 +872,23 @@ class InternLM2PreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
+            device = module.weight.data.device
+            if device == torch.device('meta'):
+                return
+            module.cuda()
             module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
+            module.to(device)
         elif isinstance(module, nn.Embedding):
+            device = module.weight.data.device
+            if device == torch.device('meta'):
+                return
+            module.cuda()
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+            module.to(device)
 
 
 InternLM2_INPUTS_DOCSTRING = r"""
@@ -1299,10 +1312,10 @@ class InternLM2ForCausalLM(InternLM2PreTrainedModel):
             logits = torch.cat(logits, dim=-1)
         else:
             logits = self.output(hidden_states)
-        logits = logits.float()
 
         loss = None
         if labels is not None:
+            logits = logits.float()
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
