@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" InternLM2 model configuration"""
+"""InternLM2 model configuration."""
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
@@ -98,6 +98,7 @@ class InternLM2Config(PretrainedConfig):
         intermediate_size=11008,
         num_hidden_layers=32,
         num_attention_heads=32,
+        head_dim=None,
         num_key_value_heads=None,
         hidden_act='silu',
         max_position_embeddings=2048,
@@ -126,6 +127,7 @@ class InternLM2Config(PretrainedConfig):
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
+        self.head_dim = head_dim
 
         self.hidden_act = hidden_act
         self.initializer_range = initializer_range
@@ -148,9 +150,7 @@ class InternLM2Config(PretrainedConfig):
         )
 
     def _rope_scaling_validation(self):
-        """
-        Validate the `rope_scaling` configuration.
-        """
+        """Validate the `rope_scaling` configuration."""
         if self.rope_scaling is None:
             return
 
