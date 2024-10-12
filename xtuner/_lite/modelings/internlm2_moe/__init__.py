@@ -1,0 +1,2 @@
+from .configuration_internlm2moe import InternLM2MoEConfig
+from .modeling_internlm2moe import InternLM2MoEForCausalLM
