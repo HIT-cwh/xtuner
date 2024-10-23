@@ -499,7 +499,7 @@ def benchmark(args):
         print(numel)
 
     if rank == 0:
-        with torch.device('cpu'):
+        with torch.device('cpu'), LoadWoInit():
             master_model = InternLM2ForCausalLM._from_config(
                 config, attn_implementation='flash_attention_2', torch_dtype=torch.bfloat16)
         master_model.to(device='cpu')
@@ -533,7 +533,7 @@ def benchmark(args):
         model,
         input_ids,
         max_batch_size=bs,
-        max_new_tokens=64,
+        max_new_tokens=output_len,
         max_length=math.ceil((input_len + output_len - 1) / 256) * 256,
         use_half_prefilling=True
     )
@@ -546,15 +546,15 @@ def benchmark(args):
         max_length=math.ceil((input_len + output_len - 1) / 256) * 256,
         use_half_prefilling=False
     )
-    torch.cuda.empty_cache()
-    contiguous_batching_generate(
-        model,
-        input_ids,
-        max_batch_size=bs,
-        max_new_tokens=output_len,
-        max_length=math.ceil((input_len + output_len - 1) / 256) * 256,
-        use_half_prefilling=True
-    )
+    # torch.cuda.empty_cache()
+    # contiguous_batching_generate(
+    #     model,
+    #     input_ids,
+    #     max_batch_size=bs,
+    #     max_new_tokens=output_len,
+    #     max_length=math.ceil((input_len + output_len - 1) / 256) * 256,
+    #     use_half_prefilling=True
+    # )
     # torch.cuda.empty_cache()
     #     contiguous_batching_generate(
     #         model,
@@ -565,7 +565,7 @@ def benchmark(args):
     #     )
     
     # if rank == 0:
-    #     prof.export_chrome_trace('trace_dense_infer.json')
+    #     prof.export_chrome_trace(f'trace_dense_bs{bs}_in{input_len}_out{output_len}.json')
 
     return
 

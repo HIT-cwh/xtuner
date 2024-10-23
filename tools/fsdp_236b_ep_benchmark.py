@@ -648,8 +648,8 @@ def benchmark(args):
         attn_implementation='flash_attention_2',
         moe_intermediate_size=1536,
         n_shared_experts=2,
-        n_routed_experts=80,
-        num_experts_per_tok=8,
+        n_routed_experts=160,
+        num_experts_per_tok=6,
         ep_size=ep_size,
         routed_scaling_factor=1.0,
         topk_method='gready',
@@ -663,7 +663,7 @@ def benchmark(args):
         seq_aux=True,
         hidden_size=5120,
         intermediate_size=12288,
-        num_hidden_layers=56,
+        num_hidden_layers=60,
         num_attention_heads=40,
         num_key_value_heads=2,
         bias=False,
@@ -774,16 +774,26 @@ def benchmark(args):
                 256 if args.max_length is None else args.max_length,
                 # max_length=4096,
                 use_half_prefilling=False)
+            torch.cuda.empty_cache()
+            contiguous_batching_generate(
+                model,
+                input_ids,
+                max_batch_size=bs,
+                max_new_tokens=output_len,
+                max_length=math.ceil((input_len + output_len - 1) / 256) *
+                256 if args.max_length is None else args.max_length,
+                # max_length=4096,
+                use_half_prefilling=True)
         if rank == 0:
             prof.export_chrome_trace(
-                f'xtuner_moe_111b_{bs}_{input_len}_{output_len}.json')
+                f'xtuner_moe_200b_{bs}_{input_len}_{output_len}.json')
     else:
         torch.cuda.empty_cache()
         contiguous_batching_generate(
             model,
             input_ids,
             max_batch_size=bs,
-            max_new_tokens=output_len,
+            max_new_tokens=8,
             max_length=math.ceil((input_len + output_len - 1) / 256) *
             256 if args.max_length is None else args.max_length,
             use_half_prefilling=True)
@@ -805,6 +815,7 @@ def benchmark(args):
             max_length=math.ceil((input_len + output_len - 1) / 256) *
             256 if args.max_length is None else args.max_length,
             use_half_prefilling=False)
+        
     # torch.cuda.empty_cache()
     # contiguous_batching_generate(
     #     model,

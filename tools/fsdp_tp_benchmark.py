@@ -68,6 +68,8 @@ def parse_args():
     parser.add_argument('--output-len', type=int, default=128)
     parser.add_argument('--work-dir', type=str, default=None)
     parser.add_argument('--tp-size', type=int, default=1)
+    parser.add_argument('--max-length', type=int, default=None)
+    parser.add_argument('--profile', action='store_true')
 
     custom_model_args = parser.add_argument_group('model',
                                                   'Custom model structure')
@@ -727,53 +729,71 @@ def benchmark(args):
     ]
     logger.success(f'bs {bs} input_len {input_len} output_len {output_len}')
 
-    # with profile(activities=[
-    #                     ProfilerActivity.CPU, ProfilerActivity.CUDA
-    #             ]) as prof:
+    if args.profile:
 
-    torch.cuda.empty_cache()
-    model.eval()
-    contiguous_batching_generate(
-        model,
-        input_ids,
-        max_batch_size=bs,
-        max_new_tokens=output_len,
-        max_length=math.ceil((input_len + output_len - 1) / 256) * 256,
-        # max_length=4096,
-        use_half_prefilling=False,
-        tp_size=args.tp_size)
-    torch.cuda.empty_cache()
-    contiguous_batching_generate(
-        model,
-        input_ids,
-        max_batch_size=bs,
-        max_new_tokens=output_len,
-        max_length=math.ceil((input_len + output_len - 1) / 256) * 256,
-        # max_length=4096,
-        use_half_prefilling=False,
-        tp_size=args.tp_size)
-    # torch.cuda.empty_cache()
-    # contiguous_batching_generate(
-    #     model,
-    #     input_ids,
-    #     max_batch_size=bs,
-    #     max_new_tokens=output_len,
-    #     # max_length=math.ceil((input_len + output_len - 1) / 256) * 256,
-    #     max_length=4096,
-    #     use_half_prefilling=True,
-    #     tp_size=args.tp_size
-    # )
-    # torch.cuda.empty_cache()
-    #     contiguous_batching_generate(
-    #         model,
-    #         input_ids,
-    #         max_batch_size=bs,
-    #         max_new_tokens=output_len,
-    #         max_length=math.ceil((input_len + output_len) / 256) * 256
-    #     )
+        with profile(activities=[
+                            ProfilerActivity.CPU, ProfilerActivity.CUDA
+                    ]) as prof:
 
-    # if rank == 0:
-    #     prof.export_chrome_trace(f'xtuner_fixtp_70b_{bs}_{input_len}_{output_len}.json')
+            torch.cuda.empty_cache()
+            model.eval()
+            contiguous_batching_generate(
+                model,
+                input_ids,
+                max_batch_size=bs,
+                max_new_tokens=output_len,
+                max_length=math.ceil((input_len + output_len - 1) / 256) * 256 if args.max_length is None else args.max_length,
+                use_half_prefilling=False,
+                tp_size=args.tp_size)
+            torch.cuda.empty_cache()
+            contiguous_batching_generate(
+                model,
+                input_ids,
+                max_batch_size=bs,
+                max_new_tokens=output_len,
+                max_length=math.ceil((input_len + output_len - 1) / 256) * 256 if args.max_length is None else args.max_length,
+                use_half_prefilling=False,
+                tp_size=args.tp_size)
+            torch.cuda.empty_cache()
+            contiguous_batching_generate(
+                model,
+                input_ids,
+                max_batch_size=bs,
+                max_new_tokens=output_len,
+                max_length=math.ceil((input_len + output_len - 1) / 256) * 256 if args.max_length is None else args.max_length,
+                use_half_prefilling=True,
+                tp_size=args.tp_size)
+        if rank == 0:
+            prof.export_chrome_trace(f'xtuner_fixtp_70b_{bs}_{input_len}_{output_len}.json')
+    else:
+        torch.cuda.empty_cache()
+        contiguous_batching_generate(
+            model,
+            input_ids,
+            max_batch_size=bs,
+            max_new_tokens=output_len,
+            max_length=math.ceil((input_len + output_len - 1) / 256) * 256 if args.max_length is None else args.max_length,
+            use_half_prefilling=True,
+            tp_size=args.tp_size)
+        torch.cuda.empty_cache()
+        contiguous_batching_generate(
+            model,
+            input_ids,
+            max_batch_size=bs,
+            max_new_tokens=output_len,
+            max_length=math.ceil((input_len + output_len - 1) / 256) * 256 if args.max_length is None else args.max_length,
+            use_half_prefilling=True,
+            tp_size=args.tp_size)
+        torch.cuda.empty_cache()
+        contiguous_batching_generate(
+            model,
+            input_ids,
+            max_batch_size=bs,
+            max_new_tokens=output_len,
+            max_length=math.ceil((input_len + output_len - 1) / 256) * 256 if args.max_length is None else args.max_length,
+            use_half_prefilling=False,
+            tp_size=args.tp_size)
+        
 
     return
 

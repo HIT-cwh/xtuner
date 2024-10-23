@@ -31,7 +31,7 @@ from xtuner._lite.parallel import (LengthGroupedSampler, ParallelSampler,
                                    get_dp_mesh, get_dp_world_size, get_ep_mesh,
                                    get_experts_fsdp_mesh, get_sp_group,
                                    get_sp_world_size,
-                                   reduce_sequence_parallel_loss,
+                                   reduce_sequence_parallel_loss, get_tp_mesh,
                                    setup_parallel, split_for_sequence_parallel)
 from xtuner._lite.parallel.fsdp import (LoadWoInit,
                                         all_required_grad_wrap_policy,
@@ -167,7 +167,7 @@ class RowwiseLinear(nn.Module):
         self.out_features = out_features
         self.weight = nn.Parameter(torch.empty((out_features, in_features)))
         self.register_parameter('bias', None)
-        self.tp_group = tp_mesh.get_group()
+        self.tp_group = tp_mesh.get_group() 
 
     def forward(self, input):
         out = F.linear(input, self.weight, self.bias)
@@ -175,7 +175,7 @@ class RowwiseLinear(nn.Module):
         return out
 
     @classmethod
-    def from_linear(cls, tp_mesh, mod):
+    def from_linear(cls, tp_mesh,  mod):
         in_features = mod.in_features // tp_mesh.size()
         out_features = mod.out_features
         with torch.device(mod.weight.device):
@@ -184,18 +184,8 @@ class RowwiseLinear(nn.Module):
         return col_fc
 
 
-def parallelize(model, tp_mesh):
-    for layer in model.model.layers:
-        attention = layer.attention
-        attention.num_heads = attention.num_heads // tp_mesh.size()
-        attention.hidden_size = attention.hidden_size // tp_mesh.size()
-        attention.wqkv = ColwiseLinear.from_linear(tp_mesh, attention.wqkv)
-        attention.wo = RowwiseLinear.from_linear(tp_mesh, attention.wo)
-    return model
-
-
 @torch.no_grad
-def ep_lazy_init(module, module_map, ep_mesh):
+def ep_tp_lazy_init(module, module_map, ep_mesh, tp_mesh):
 
     device = torch.cuda.current_device()
     module.to_empty(device=torch.cuda.current_device(), recurse=False)
@@ -215,6 +205,7 @@ def ep_lazy_init(module, module_map, ep_mesh):
         master_buffers = None
     rank = dist.get_rank()
     ep_rank = ep_mesh.get_local_rank()
+    tp_rank = tp_mesh.get_local_rank()
 
     if type(module).__name__ == 'GroupedLinear':
         n_experts = module.w1w3.shape[0]
@@ -236,6 +227,30 @@ def ep_lazy_init(module, module_map, ep_mesh):
         w2 = w2_copy[ep_rank * n_experts:(ep_rank + 1) * n_experts]
         module.w1w3.data.copy_(w1w3)
         module.w2.data.copy_(w2)
+    elif isinstance(module, ColwiseLinear):
+        out_features = module.out_features
+        in_features = module.in_features
+        if rank == 0:
+            p_copy = master_module.weight.to(device).to(module.weight.dtype)
+        else:
+            p_copy = torch.empty((out_features * tp_mesh.size(), in_features),
+                                 dtype=module.weight.dtype,
+                                 device=device)
+        torch.distributed.broadcast(p_copy, 0)
+        w = p_copy[tp_rank * out_features:(tp_rank + 1) * out_features]
+        module.weight.data.copy_(w)
+    elif isinstance(module, RowwiseLinear):
+        out_features = module.out_features
+        in_features = module.in_features
+        if rank == 0:
+            p_copy = master_module.weight.to(device).to(module.weight.dtype)
+        else:
+            p_copy = torch.empty((out_features, in_features * tp_mesh.size()),
+                                 dtype=module.weight.dtype,
+                                 device=device)
+        torch.distributed.broadcast(p_copy, 0)
+        w = p_copy[:, tp_rank * in_features:(tp_rank + 1) * in_features]
+        module.weight.data.copy_(w)
     else:
         for name, param in module.named_parameters(recurse=False):
             if isinstance(param, DTensor):
@@ -638,10 +653,12 @@ def benchmark(args):
     set_random_seed(0)
     rank = dist.get_rank()
     ep_size = args.ep_size
-    setup_parallel(ep_size=ep_size)
+    tp_size = 8
+    setup_parallel(ep_size=ep_size, tp_size=tp_size)
     dp_size = get_dp_world_size()
     ep_mesh = get_ep_mesh()
     dp_mesh = get_dp_mesh()
+    tp_mesh = get_tp_mesh()
 
     config = InternLM2MoEConfig(
         max_position_embeddings=8192,
@@ -665,11 +682,13 @@ def benchmark(args):
         intermediate_size=12288,
         num_hidden_layers=56,
         num_attention_heads=40,
-        num_key_value_heads=2,
+        num_key_value_heads=8,
         bias=False,
         rope_theta=50000000,
         architectures='InternLM2ForCausalLM',  # for lmdeploy
         torch_dtype=torch.bfloat16,
+
+        use_tp8=True
 
         # debug=True
     )
@@ -680,37 +699,38 @@ def benchmark(args):
             attn_implementation='flash_attention_2',
             torch_dtype=torch.bfloat16)
 
-    for name, module in model.named_modules():
-        module.name = name
-
     if rank == 0:
         cal(model, config)
-    #     breakpoint()
-    # else:
-    #     time.sleep(100000)
 
-    # def _apply_ep(module, device_mesh):
-    #     for m in module.modules():
-    #         if type(m).__name__ in ('ExpertEp', 'GroupedLinear'):
-    #             w1w3 = nn.Parameter(
-    #                 distribute_tensor(m.w1w3, device_mesh, [Shard(0)]))
-    #             m.register_parameter('w1w3', w1w3)
-    #             w2 = nn.Parameter(distribute_tensor(m.w2, device_mesh, [Shard(0)]))
-    #             m.register_parameter('w2', w2)
-
-    def _apply_ep(module, device_mesh):
-        for m in module.modules():
-            if type(m).__name__ in ('ExpertEp', 'GroupedLinear'):
-                n_experts = m.w1w3.shape[0] // device_mesh.size()
-                ep_rank = device_mesh.get_local_rank()
-                w1w3 = nn.Parameter(m.w1w3[ep_rank * n_experts:(ep_rank + 1) *
-                                           n_experts])
-                m.register_parameter('w1w3', w1w3)
-                w2 = nn.Parameter(m.w2[ep_rank * n_experts:(ep_rank + 1) *
-                                       n_experts])
-                m.register_parameter('w2', w2)
-
-    _apply_ep(model, ep_mesh)
+    # apply ep
+    for m in model.modules():
+        if type(m).__name__ in ('ExpertEp', 'GroupedLinear'):
+            n_experts = m.w1w3.shape[0] // ep_mesh.size()
+            ep_rank = ep_mesh.get_local_rank()
+            w1w3 = nn.Parameter(m.w1w3[ep_rank * n_experts:(ep_rank + 1) *
+                                        n_experts])
+            m.register_parameter('w1w3', w1w3)
+            w2 = nn.Parameter(m.w2[ep_rank * n_experts:(ep_rank + 1) *
+                                    n_experts])
+            m.register_parameter('w2', w2)
+    
+    if rank == 0:
+        print('after apply ep')
+    
+    # apply tp 8
+    for layer in model.model.layers:
+        attention = layer.attention
+        attention.num_heads = attention.num_heads // tp_mesh.size()
+        attention.hidden_size = attention.hidden_size // tp_mesh.size()
+        attention.wqkv = ColwiseLinear.from_linear(tp_mesh, attention.wqkv)
+        attention.wo = RowwiseLinear.from_linear(tp_mesh, attention.wo)
+    
+    if rank == 0:
+        print('after apply tp')
+        print(model)
+    
+    for name, module in model.named_modules():
+        module.name = name
 
     if rank == 0:
         cfg = copy.deepcopy(config)
@@ -725,13 +745,13 @@ def benchmark(args):
             if type(module).__name__ == 'MoEGate':
                 init.kaiming_uniform_(module.weight, a=math.sqrt(5))
         master_mod_map = map_meta_modules(master_model, model)
-        logger.info('after build master model')
+        print('after map master model')
     else:
         master_model = None
         master_mod_map = None
 
     lazy_param_init_fn = partial(
-        ep_lazy_init, module_map=master_mod_map, ep_mesh=ep_mesh)
+        ep_tp_lazy_init, module_map=master_mod_map, ep_mesh=ep_mesh, tp_mesh=tp_mesh)
 
     model.apply(lazy_param_init_fn)
 
@@ -743,12 +763,16 @@ def benchmark(args):
     bs = args.bs
     input_len = args.input_len
     output_len = args.output_len
-    set_random_seed(rank)
+    set_random_seed(dp_mesh.get_local_rank())
     input_ids = [
         torch.randint(0, 10000, (1, input_len)).long().cuda()
         for _ in range(bs)
     ]
     logger.success(f'bs {bs} input_len {input_len} output_len {output_len}')
+
+    torch.cuda.reset_peak_memory_stats()
+    max_memory = torch.cuda.max_memory_allocated()
+    print(f'before contiguous_batching_generate {max_memory // 1024**3}')
 
     if args.profile:
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA
@@ -763,7 +787,8 @@ def benchmark(args):
                 max_length=math.ceil((input_len + output_len - 1) / 256) *
                 256 if args.max_length is None else args.max_length,
                 # max_length=4096,
-                use_half_prefilling=False)
+                use_half_prefilling=False,
+                tp_size=tp_size)
             torch.cuda.empty_cache()
             contiguous_batching_generate(
                 model,
@@ -773,10 +798,11 @@ def benchmark(args):
                 max_length=math.ceil((input_len + output_len - 1) / 256) *
                 256 if args.max_length is None else args.max_length,
                 # max_length=4096,
-                use_half_prefilling=False)
+                use_half_prefilling=False,
+                tp_size=tp_size)
         if rank == 0:
             prof.export_chrome_trace(
-                f'xtuner_moe_111b_{bs}_{input_len}_{output_len}.json')
+                f'xtuner_moe_111b_tp8_{bs}_{input_len}_{output_len}.json')
     else:
         torch.cuda.empty_cache()
         contiguous_batching_generate(
@@ -786,7 +812,9 @@ def benchmark(args):
             max_new_tokens=output_len,
             max_length=math.ceil((input_len + output_len - 1) / 256) *
             256 if args.max_length is None else args.max_length,
-            use_half_prefilling=True)
+            # max_length=4096,
+            use_half_prefilling=False,
+            tp_size=tp_size)
         torch.cuda.empty_cache()
         contiguous_batching_generate(
             model,
@@ -795,16 +823,9 @@ def benchmark(args):
             max_new_tokens=output_len,
             max_length=math.ceil((input_len + output_len - 1) / 256) *
             256 if args.max_length is None else args.max_length,
-            use_half_prefilling=True)
-        torch.cuda.empty_cache()
-        contiguous_batching_generate(
-            model,
-            input_ids,
-            max_batch_size=bs,
-            max_new_tokens=output_len,
-            max_length=math.ceil((input_len + output_len - 1) / 256) *
-            256 if args.max_length is None else args.max_length,
-            use_half_prefilling=False)
+            # max_length=4096,
+            use_half_prefilling=False,
+            tp_size=tp_size)
     # torch.cuda.empty_cache()
     # contiguous_batching_generate(
     #     model,
