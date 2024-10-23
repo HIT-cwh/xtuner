@@ -67,7 +67,7 @@ except ImportError:
     gmm = None
     group_gemm = None
 
-from xtuner._lite.parallel import get_ep_group, get_ep_world_size
+from xtuner._lite.parallel import get_ep_group, get_ep_world_size, get_tp_group
 
 logger = logging.get_logger(__name__)
 
@@ -605,6 +605,110 @@ class InternLM2MoE(nn.Module):
         assert output.dtype == torch.bfloat16
         return output
 
+    def forward(self, hidden_states):
+        identity = hidden_states
+        if self.config.n_shared_experts is not None:
+            z = self.shared_experts(identity)
+        orig_shape = hidden_states.shape
+        # (s, topk)
+        topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        y = self.moe_forward(hidden_states, topk_idx,
+                             topk_weight).view(*orig_shape)
+        if self.training:
+            y = AddAuxiliaryLoss.apply(y, aux_loss)
+        y = y + z
+        return y
+
+
+class InternLM2MoEEPTP(nn.Module):
+    """
+    由于大 MoE 推理必须要开EP8，所以暂时先只考虑 EP8 TP8 的情况
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.expert_in_one_shard = config.n_routed_experts
+        self.n_routed_experts = config.n_routed_experts
+        ep_size = config.ep_size
+        ep_group = get_ep_group()
+        tp_group = get_tp_group()
+
+        self.ep_rank = dist.get_rank(group=ep_group)
+        self.ep_size = ep_size
+        self.experts_per_rank = config.n_routed_experts // ep_size
+        self.experts = nn.ModuleList(
+            [GroupedLinear(config, config.n_routed_experts, ep_size)])
+        
+        local_expert_indices_offset = self.ep_rank * self.experts_per_rank
+        self.local_expert_indices = [
+            local_expert_indices_offset + i
+            for i in range(self.experts_per_rank)
+        ]
+        self.expert_ids_per_ep_rank = torch.tensor(
+            [i % self.experts_per_rank for i in range(self.n_routed_experts)],
+            dtype=torch.int32,
+            device='cuda',
+        )
+
+        self.gate = MoEGate(config)
+        if config.n_shared_experts is not None:
+            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+            self.shared_experts = InternLM2MLP(
+                config=config, intermediate_size=intermediate_size)
+
+    def moe_forward(self, x, topk_ids, topk_weight):
+        rank = dist.get_rank()
+        # (e, )
+        tokens_per_expert = torch.histc(
+            topk_ids,
+            bins=self.n_routed_experts,
+            min=0,
+            max=self.n_routed_experts)
+
+        hiddden_shape_before_permute = x.shape
+        # permute output 相同 expert 的tokens在一起
+        permutated_local_input_tokens, reversed_local_input_permutation_mapping = grouped_gemm.ops.permute(
+            x, topk_ids.to(torch.int32), None)
+        
+        tokens_per_expert_acc = torch.cumsum(
+            tokens_per_expert.reshape(self.ep_size, self.experts_per_rank).sum(dim=1), 0
+        )
+        if self.ep_rank == 0:
+            global_input_tokens = permutated_local_input_tokens[:tokens_per_expert_acc[0]]
+        else:
+            global_input_tokens = permutated_local_input_tokens[tokens_per_expert_acc[self.ep_rank - 1]: tokens_per_expert_acc[self.ep_rank]]
+        num_tokens_per_local_expert = tokens_per_expert[self.local_expert_indices].cpu()
+
+        expert_output = self.experts[0](
+            global_input_tokens, tokens_per_expert=num_tokens_per_local_expert)
+
+        mask = torch.ones(reversed_local_input_permutation_mapping.numel(), device='cuda', dtype=torch.bool)
+        mask[tokens_per_expert_acc[self.ep_rank - 1]: tokens_per_expert_acc[self.ep_rank]] = False
+        mask = mask.view(topk_ids.shape[1], topk_ids.shape[0]).t()
+        topk_weight[mask] = 0
+        
+        # tensor_list = []
+        # for i in range(self.ep_size):
+        #     if i == 0:
+        #         tensor_list.append(permutated_local_input_tokens[:tokens_per_expert_acc[0]])
+        #     else:
+        #         tensor_list.append(permutated_local_input_tokens[tokens_per_expert_acc[i - 1]: tokens_per_expert_acc[i]])
+        
+        # dist.all_gather(tensor_list, expert_output)
+        
+        # permutated_local_input_tokens = torch.cat(tensor_list)
+        output = grouped_gemm.ops.unpermute(
+            expert_output,
+            reversed_local_input_permutation_mapping,
+            topk_weight.to(torch.float32),
+        )
+        dist.all_reduce(output)
+        assert output.dtype == torch.bfloat16
+        return output
+    
     def forward(self, hidden_states):
         identity = hidden_states
         if self.config.n_shared_experts is not None:
@@ -1164,8 +1268,13 @@ class InternLM2DecoderLayer(nn.Module):
             config.attn_implementation](
                 config=config, layer_idx=layer_idx)
         
+        if config.use_tp8:
+            moe_block = InternLM2MoEEPTP
+        else:
+            moe_block = InternLM2MoE
+            
         self.feed_forward = (
-            InternLM2MoE(config) if
+            moe_block(config) if
             (config.n_routed_experts is not None
              and layer_idx >= config.first_k_dense_replace and layer_idx %
              config.moe_layer_freq == 0) else InternLM2MLP(config))

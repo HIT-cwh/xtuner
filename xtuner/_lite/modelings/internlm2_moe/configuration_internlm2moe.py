@@ -131,6 +131,7 @@ class InternLM2MoEConfig(PretrainedConfig):
         seq_aux=True,
 
         debug=False,  # 如果是debug模式，路由是手动指定的
+        use_tp8=False,
 
         **kwargs,
     ):
@@ -151,6 +152,7 @@ class InternLM2MoEConfig(PretrainedConfig):
         self.seq_aux = seq_aux
 
         self.debug = debug
+        self.use_tp8 = use_tp8
 
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
