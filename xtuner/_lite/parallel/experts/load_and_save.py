@@ -100,11 +100,11 @@ def _merge_experts_weight(state_dict,
         print_on_rank0(f'merged key {merged_key_w1w3}')
         if trans_w:
             w1w3 = w1w3.transpose(1, 2)
-        state_dict[merged_key_w1w3] = w1w3
+        state_dict[merged_key_w1w3] = w1w3.flatten(0, 1)
         print_on_rank0(f'merged key {merged_key_w2}')
         if trans_w:
             w2 = w2.transpose(1, 2)
-        state_dict[merged_key_w2] = w2
+        state_dict[merged_key_w2] = w2.flatten(0, 1)
 
     return
 
