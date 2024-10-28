@@ -165,6 +165,10 @@ class DeepseekV2Config(PretrainedConfig):
         attention_dropout=0.0,
         moe_implementation='origin',
         expert_in_one_shard=None,
+
+        use_gqa=False,
+        head_dim=128,
+
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -209,6 +213,9 @@ class DeepseekV2Config(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.moe_implementation = moe_implementation
         self.expert_in_one_shard = expert_in_one_shard
+
+        self.use_gqa = use_gqa
+        self.head_dim = head_dim
 
         super().__init__(
             pad_token_id=pad_token_id,
