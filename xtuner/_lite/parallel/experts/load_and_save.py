@@ -21,17 +21,21 @@ from ..comm import barrier
 SUPPORT_MODELS = (
     'DeepseekV2ForCausalLM',
     'MixtralForCausalLM',
+    'Qwen2MoeForCausalLM',
 )
 
 ORDER_MAPPING = dict(
     DeepseekV2ForCausalLM=dict(down_proj=0, gate_proj=1, up_proj=2),
     MixtralForCausalLM=dict(down_proj=1, gate_proj=0, up_proj=2),
+    Qwen2MoeForCausalLM=dict(down_proj=0, gate_proj=1, up_proj=2),
 )
 
 PARAM_NAME_MAPPING = dict(
     DeepseekV2ForCausalLM=dict(
         gate_proj='gate_proj', up_proj='up_proj', down_proj='down_proj'),
     MixtralForCausalLM=dict(gate_proj='w1', up_proj='w3', down_proj='w2'),
+    Qwen2MoeForCausalLM=dict(
+        gate_proj='gate_proj', up_proj='up_proj', down_proj='down_proj'),
 )
 
 
@@ -177,6 +181,13 @@ def load_state_dict_into_model(model_to_load,
                      prefix + name + '.')
 
     state_dict = OrderedDict()
+    while unloaded_shard_files:
+        shard_file = unloaded_shard_files.pop()
+        shard_file = os.path.join(pretrained_model_path, shard_file)
+        new_shard = load_state_dict(shard_file, is_quantized=False)
+        state_dict.update(new_shard)
+    _merge_experts_weight(state_dict, expert_num_per_shard,
+                                    order_mapping, trans_w)
     load(model_to_load, state_dict, unloaded_shard_files, prefix='')
     print_on_rank0(f'{state_dict.keys()}')
     del state_dict
