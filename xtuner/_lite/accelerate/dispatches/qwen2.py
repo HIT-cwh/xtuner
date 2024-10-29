@@ -183,7 +183,8 @@ def qwen2_varlen_attn_forward(
 
     # ---------------- flash attention forward end ------------------- #
 
-    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+    # attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+    attn_output = attn_output.reshape(bsz, q_len, -1)
     attn_output = self.o_proj(attn_output)
 
     if not output_attentions:
