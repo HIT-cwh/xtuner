@@ -34,6 +34,13 @@ def dispatch_qwen2_varlen_attn_forward(module):
     return qwen2_varlen_attn_forward.__name__
 
 
+def dispatch_qwen2_moe_varlen_attn_forward(module):
+    assert module.__class__.__name__ == 'Qwen2MoeFlashAttention2'
+    from .qwen2 import qwen2_varlen_attn_forward
+    _dispatch_forward_fn(module, qwen2_varlen_attn_forward)
+    return qwen2_varlen_attn_forward.__name__
+
+
 def dispatch_clip_attn_forward(module):
     assert module.__class__.__name__ == 'CLIPAttention'
     from .clip import clip_flash_attn_forward
@@ -64,6 +71,8 @@ DISPATCH_MAP = {
     'Qwen2FlashAttention2': dispatch_qwen2_varlen_attn_forward,
     'Qwen2RMSNorm': dispatch_rms_norm_forward,
     'DeepseekV2RMSNorm': dispatch_rms_norm_forward,
+    'Qwen2MoeFlashAttention2': dispatch_qwen2_moe_varlen_attn_forward,
+    'Qwen2MoeRMSNorm': dispatch_rms_norm_forward,
 }
 
 
