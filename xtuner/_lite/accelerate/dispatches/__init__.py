@@ -14,8 +14,7 @@ def _dispatch_forward_fn(module, dispatch_fn):
 
 def dispatch_internlm_varlen_attn_forward(module):
     assert module.__class__.__name__ == 'InternLM2FlashAttention2'
-    # from .internlm2 import internlm2_varlen_attn_forward
-    from .internlm2_flash_attn3 import internlm2_varlen_attn_forward
+    from .internlm2 import internlm2_varlen_attn_forward
     _dispatch_forward_fn(module, internlm2_varlen_attn_forward)
     return internlm2_varlen_attn_forward.__name__
 

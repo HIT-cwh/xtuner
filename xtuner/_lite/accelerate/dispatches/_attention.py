@@ -14,6 +14,14 @@ except ImportError:
     pass
 
 
+SUPPORT_FLASH3 = False
+try:
+    from flash_attn_interface import flash_attn_varlen_func as flash_attn3_varlen_func
+    SUPPORT_FLASH3 = True
+except:
+    flash_attn3_varlen_func = None
+
+
 def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
@@ -137,17 +145,29 @@ def varlen_flash_attn(
 ):
     q_unpad, k_unpad, v_unpad = query_states.flatten(0, 1), key_states.flatten(
         0, 1), value_states.flatten(0, 1)
-    attn_output = flash_attn_varlen_func(
-        q_unpad,
-        k_unpad,
-        v_unpad,
-        cumulative_len,
-        cumulative_len,
-        max_seqlen,
-        max_seqlen,
-        dropout_p=dropout_p,
-        return_attn_probs=False,
-        causal=causal,
-        window_size=window_size)
+    if SUPPORT_FLASH3:
+        attn_output, _ = flash_attn3_varlen_func(
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cumulative_len,
+            cumulative_len,
+            max_seqlen,
+            max_seqlen,
+            causal=causal,
+            window_size=window_size)
+    else:
+        attn_output = flash_attn_varlen_func(
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cumulative_len,
+            cumulative_len,
+            max_seqlen,
+            max_seqlen,
+            dropout_p=dropout_p,
+            return_attn_probs=False,
+            causal=causal,
+            window_size=window_size)
     attn_output = attn_output.unsqueeze(0)
     return attn_output
