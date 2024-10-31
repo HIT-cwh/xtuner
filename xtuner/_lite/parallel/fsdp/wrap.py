@@ -6,7 +6,7 @@ logger = get_logger()
 _LAYERS = [
     'InternLM2DecoderLayer', 'CLIPVisionModel', 'LlavaMultiModalProjector',
     'LlamaDecoderLayer', 'Qwen2DecoderLayer', 'DeepseekV2DecoderLayer',
-    'DeepseekV2DecoderLayer'
+    'DeepseekV2DecoderLayer', 'Qwen2MoeDecoderLayer'
 ]
 
 
