@@ -253,6 +253,8 @@ def get_origin_state_dict(state_dict, model, trans_w=False):
                                                     is_w1w3,
                                                     param_name_mapping)
         merged_param = state_dict.pop(expert_param_name)
+        # we have fused the n_experts dim (dim0) and dim1
+        merged_param = merged_param.reshape(expert_num_per_shard, -1, merged_param.shape[-1])
         origin_params = _split_param(merged_param, is_w1w3, trans_w)
         assert len(origin_param_names) == len(origin_params)
         for name, param in zip(origin_param_names, origin_params):
@@ -345,6 +347,41 @@ def save_hf_model(shard_model,
         state_dict = get_ep_state_dict(shard_model, save_dtype=save_dtype)
 
     if (not dist.is_initialized()) or dist.get_rank() == 0:
+        assert isinstance(origin_model, PreTrainedModel)
+        config = shard_model.config
+        moe_implementation = getattr(config, 'moe_implementation', 'origin')
+        use_ep = moe_implementation == 'ep'
+        if use_ep:
+            state_dict = get_origin_state_dict(
+                state_dict, origin_model, trans_w=True)
+        print(f'Saving LLM to {ckpt_dir}')
+        origin_model.save_pretrained(ckpt_dir, state_dict=state_dict)
+        print(f'Saving LLM tokenizer to {ckpt_dir}')
+        tokenizer.save_pretrained(ckpt_dir)
+
+    barrier()
+
+
+@torch.no_grad()
+def save_hf_model_fsdp2(shard_model,
+                  origin_model,
+                  tokenizer,
+                  ckpt_dir,
+                  save_dtype=torch.float16):
+    rank = dist.get_rank()
+    if rank == 0:
+        state_dict = {}
+    
+    for name, param in shard_model.state_dict().items():
+        if isinstance(param, DTensor):
+            full_param = param.full_tensor().to(save_dtype).cpu()
+        else:
+            full_param = param.to(save_dtype).cpu()
+        
+        if rank == 0:
+            state_dict[name] = full_param
+
+    if (not dist.is_initialized()) or rank == 0:
         assert isinstance(origin_model, PreTrainedModel)
         config = shard_model.config
         moe_implementation = getattr(config, 'moe_implementation', 'origin')
