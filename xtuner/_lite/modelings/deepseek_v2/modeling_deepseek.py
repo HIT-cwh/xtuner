@@ -821,10 +821,6 @@ class ExpertEp(nn.Module):
 
 
 class GroupedLinear(nn.Module):
-    """Vanilla Feed forward using Gmm/Bmm.
-
-    WP not supported.
-    """
 
     def __init__(self, config, expert_in_one_shard=10, ep_size=1):
         super().__init__()
@@ -860,10 +856,12 @@ class GroupedLinear(nn.Module):
         out = gate_out * up_out
         out = gmm(out, w2, tokens_per_expert)
         return out
+    
+    def extra_repr(self) -> str:
+        return f"num_experts={self.expert_in_one_shard}, hidden_dim={self.hidden_dim}, ffn_dim={self.ffn_dim}"
 
 
 class _AllToAll(torch.autograd.Function):
-    """All to all communication."""
 
     @staticmethod
     def forward(
@@ -873,7 +871,7 @@ class _AllToAll(torch.autograd.Function):
         input_split_sizes=None,
         group: dist.ProcessGroup = None,
         async_op=False,
-    ) -> Tensor:  # type: ignore
+    ) -> Tensor:
 
         ctx.input_shape = inputs.shape
         ctx.output_split_sizes = output_split_sizes
@@ -881,7 +879,6 @@ class _AllToAll(torch.autograd.Function):
         ctx.group = group
 
         world_size = dist.get_world_size(group=group)
-        # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return inputs, None
 
@@ -899,13 +896,11 @@ class _AllToAll(torch.autograd.Function):
             async_op=async_op,
         )
 
-        # if async_op=False, handle will be None
         return out, handle
 
     @staticmethod
     def backward(ctx: Any, grad_output: Tensor, _) -> Tuple[None, Tensor]:
         if ctx.needs_input_grad[0]:
-            # Bypass the function if we are using only 1 GPU.
             world_size = dist.get_world_size(group=ctx.group)
             if world_size == 1:
                 return grad_output, None, None, None, None
