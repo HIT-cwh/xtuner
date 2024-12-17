@@ -42,6 +42,8 @@ def sample(logits,do_sample=True, top_k=0, top_p=0.9, temperature=1.0):
     return torch.multinomial(probs, 1).squeeze(-1)
 
 
+import time
+
 @torch.no_grad()
 def contiguous_batching_generate(model,
                                  input_ids,
@@ -54,7 +56,8 @@ def contiguous_batching_generate(model,
                                  top_p=1.0,
                                  temperature=1.0,
                                  tp_size=1,
-                                 device='cuda'):
+                                 device='cuda',
+                                 use_compile=True):
 
     model.config.use_cache = True
 
@@ -101,7 +104,22 @@ def contiguous_batching_generate(model,
 
     responses = [[] for _ in range(num_sessions)]
 
+    def apply_compile(model):
+        for idx, layer in enumerate(model.model.layers):
+            layer = torch.compile(layer, fullgraph=True)
+            model.model.layers[idx] = layer
+        # model.model.embed_tokens = torch.compile(model.model.embed_tokens, fullgraph=True)
+        model.lm_head = torch.compile(model.lm_head, fullgraph=True)
+
+    if use_compile:
+        apply_compile(model)
+    
+    idx = 0
+
     while len(waiting) or len(computing):
+        idx += 1
+        if idx == 3:
+            t1 = time.time()
 
         attn_ctx = MessageHub.get_instance('paged_attention')
         attn_ctx.update_info('block_offsets', next_block_table)
@@ -121,6 +139,16 @@ def contiguous_batching_generate(model,
             position_ids=next_position_ids,
             past_key_values=cache_engine.gpu_cache,
             cache_position=next_position_ids,
+            use_cache=False,
+
+            block_offsets=next_block_table,
+            kv_seq_length=next_cache_length,
+            q_seq_length=next_query_length,
+            max_kv_seq_length=next_cache_length.max().item(),
+            max_q_seq_length=next_query_length.max().item(),
+            q_start_loc=next_start_pos,
+            cumulative_length=next_cumulative_length,
+            is_prefilling=next_is_prefilling
         )
 
         for key in list(attn_ctx.runtime_info.keys()):
@@ -192,6 +220,8 @@ def contiguous_batching_generate(model,
 
         next_cumulative_length = _cumulative_length.to(device)
         next_is_prefilling = False
+    
+    print(time.time() - t1)
 
     for i in range(len(cache_engine.gpu_cache)):
         cache_engine.gpu_cache.pop()

@@ -34,7 +34,7 @@ def _tp_qwen2(model, tp_mesh):
         PrepareModuleInput(
             input_layouts=(Replicate(), ),
             desired_input_layouts=(Replicate(), ),
-            use_local_output=True
+            # use_local_output=True
         ),
         'mlp.up_proj':
         ColwiseParallel(),
@@ -46,7 +46,7 @@ def _tp_qwen2(model, tp_mesh):
         PrepareModuleInput(
             input_layouts=(Replicate(), ),
             desired_input_layouts=(Replicate(), ),
-            use_local_output=True
+            # use_local_output=True
         )
     }
 
@@ -101,7 +101,7 @@ def _tp_qwen2(model, tp_mesh):
             'model.norm':PrepareModuleInput(
                 input_layouts=(Replicate(),),
                 desired_input_layouts=(Replicate(),),
-                use_local_output=True
+                # use_local_output=True
             ),
         })
 

@@ -4,6 +4,7 @@ import warnings
 from typing import List, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from mmengine import MessageHub
 from transformers.cache_utils import Cache
 from transformers.models.qwen2.modeling_qwen2 import (apply_rotary_pos_emb,
@@ -194,9 +195,191 @@ def _qwen2_attn_varlen_forward(
     return attn_output, attn_weights, past_key_value
 
 
+from lmdeploy.pytorch.kernels import \
+    apply_rotary_pos_emb as apply_rotary_pos_emb_lmdeploy
+from lmdeploy.pytorch.kernels import fill_kv_cache, paged_attention_fwd
+from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from torch import Tensor
 
 
-def _qwen2_attn_contiguous_batching_forward(
+@torch.library.custom_op("attn::fill_kv_cache_op", mutates_args=('k_caches', 'v_caches'))
+def fill_kv_cache_op(
+    key_states: Tensor,
+    value_states: Tensor,
+    k_caches: Tensor,
+    v_caches: Tensor,
+    q_start_loc: Tensor,
+    q_seq_length: Tensor,
+    kv_seq_length: Tensor,
+    max_q_seq_length: int,
+    block_offsets: Tensor,
+) -> None:
+    max_q_seq_length = torch.tensor(max_q_seq_length).cuda()
+    fill_kv_cache(
+        key_states,
+        value_states,
+        k_caches,
+        v_caches,
+        q_start_loc,
+        q_seq_length,
+        kv_seq_length=kv_seq_length,
+        max_q_seq_length=max_q_seq_length,
+        block_offsets=block_offsets,
+    )
+    return 
+
+
+@fill_kv_cache_op.register_fake
+def _(
+    key_states: Tensor,
+    value_states: Tensor,
+    k_caches: Tensor,
+    v_caches: Tensor,
+    q_start_loc: Tensor,
+    q_seq_length: Tensor,
+    kv_seq_length: Tensor,
+    max_q_seq_length: int,
+    block_offsets: Tensor,
+) -> None:
+    return 
+
+
+import flash_attn_2_cuda as flash_attn_cuda
+@torch.library.custom_op("attn::fwd_kvcache_op", mutates_args=())
+def fwd_kvcache_op(
+    q: Tensor,
+    k_cache: Tensor,
+    v_cache: Tensor,
+    k: Optional[Tensor],
+    v: Optional[Tensor],
+    cache_seqlens: Tensor,
+    rotary_cos: Optional[Tensor],
+    rotary_sin: Optional[Tensor],
+    cache_batch_idx: Optional[Tensor],
+    cache_leftpad: Optional[Tensor],
+    block_table: Optional[Tensor],
+    alibi_slopes: Optional[Tensor],
+    softmax_scale: float,
+    causal: bool,
+    window_size0: int,
+    window_size1: int,
+    softcap: float,
+    rotary_interleaved: bool,
+    num_splits: int,
+) -> Tensor:
+    out, softmax_lse = flash_attn_cuda.fwd_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        k,
+        v,
+        cache_seqlens,
+        rotary_cos,
+        rotary_sin,
+        cache_batch_idx,
+        cache_leftpad,
+        block_table,
+        alibi_slopes,
+        None,
+        softmax_scale,
+        causal,
+        window_size0,
+        window_size1,
+        softcap,
+        rotary_interleaved,
+        num_splits,
+    )
+    return out
+
+
+@fwd_kvcache_op.register_fake
+def _(
+    q: Tensor,
+    k_cache: Tensor,
+    v_cache: Tensor,
+    k: Optional[Tensor],
+    v: Optional[Tensor],
+    cache_seqlens: Tensor,
+    rotary_cos: Optional[Tensor],
+    rotary_sin: Optional[Tensor],
+    cache_batch_idx: Optional[Tensor],
+    cache_leftpad: Optional[Tensor],
+    block_table: Optional[Tensor],
+    alibi_slopes: Optional[Tensor],
+    softmax_scale: float,
+    causal: bool,
+    window_size0: int,
+    window_size1: int,
+    softcap: float,
+    rotary_interleaved: bool,
+    num_splits: int,
+) -> Tensor:
+    return torch.empty_like(q)
+
+
+def maybe_contiguous(x):
+    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def flash_attn_with_kvcache_op(
+    q,
+    k_cache,
+    v_cache,
+    k=None,
+    v=None,
+    rotary_cos=None,
+    rotary_sin=None,
+    cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
+    cache_batch_idx: Optional[torch.Tensor] = None,
+    cache_leftpad: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    softcap=0.0, # 0.0 means deactivated
+    rotary_interleaved=True,
+    alibi_slopes=None,
+    num_splits=0,
+    return_softmax_lse=False,
+):
+    assert not return_softmax_lse
+    assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
+    assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    if cache_seqlens is not None and isinstance(cache_seqlens, int):
+        cache_seqlens = torch.full(
+            (k_cache.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
+        )
+        cache_seqlens = maybe_contiguous(cache_seqlens)
+    cache_batch_idx = maybe_contiguous(cache_batch_idx)
+    block_table = maybe_contiguous(block_table)
+    out = fwd_kvcache_op(
+        q,
+        k_cache,
+        v_cache,
+        k,
+        v,
+        cache_seqlens,
+        rotary_cos,
+        rotary_sin,
+        cache_batch_idx,
+        cache_leftpad,
+        block_table,
+        alibi_slopes,
+        softmax_scale,
+        causal,
+        window_size[0],
+        window_size[1],
+        softcap,
+        rotary_interleaved,
+        num_splits,
+    )
+    return out
+
+
+def qwen2_attn_flash_forward(
     self,
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
@@ -207,19 +390,14 @@ def _qwen2_attn_contiguous_batching_forward(
     **kwargs,
 ):
     
-
-    from lmdeploy.pytorch.kernels import \
-        apply_rotary_pos_emb as apply_rotary_pos_emb_lmdeploy
-    from lmdeploy.pytorch.kernels import fill_kv_cache, paged_attention_fwd
-    attn_ctx = MessageHub.get_instance('paged_attention')
-    kv_seq_length = attn_ctx.get_info('kv_seq_length')
-    q_seq_length = attn_ctx.get_info('q_seq_length')
-    q_start_loc = attn_ctx.get_info('q_start_loc')
-    block_offsets = attn_ctx.get_info('block_offsets')
-    max_q_seq_length = attn_ctx.get_info('max_q_seq_length')
-    max_kv_seq_length = attn_ctx.get_info('max_kv_seq_length')
-    cumulative_length = attn_ctx.get_info('cumulative_length')
-    is_prefilling = attn_ctx.get_info('is_prefilling')
+    kv_seq_length = kwargs['kv_seq_length']
+    q_seq_length = kwargs['q_seq_length']
+    q_start_loc = kwargs['q_start_loc']
+    block_offsets = kwargs['block_offsets']
+    max_q_seq_length = kwargs['max_q_seq_length']
+    max_kv_seq_length = kwargs['max_kv_seq_length']
+    cumulative_length = kwargs['cumulative_length']
+    is_prefilling = kwargs['is_prefilling']
     
     bsz, q_len, _ = hidden_states.size()
 
@@ -238,17 +416,18 @@ def _qwen2_attn_contiguous_batching_forward(
 
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states,
                                                     cos, sin, position_ids)
-
-    fill_kv_cache(
-        key_states.transpose(1, 2),
+    
+    # fill_kv_cache(
+    fill_kv_cache_op(
+        key_states.transpose(1, 2),  # torch.Size([1, 3, 2, 64])
         value_states.transpose(1, 2),
-        past_key_value[self.layer_idx][0],
+        past_key_value[self.layer_idx][0],  # torch.Size([8, 256, 2, 64])
         past_key_value[self.layer_idx][1],
-        q_start_loc,
-        q_seq_length,
-        kv_seq_length=kv_seq_length,
-        max_q_seq_length=max_q_seq_length,
-        block_offsets=block_offsets,
+        q_start_loc,  # tensor([0]
+        q_seq_length,  # tensor([3]
+        kv_seq_length=kv_seq_length,  # tensor([3
+        max_q_seq_length=max_q_seq_length,  # tensor(3
+        block_offsets=block_offsets,  # tensor([[0, 1, 2, 3, 4, 5, 6, 7]]
     )
 
     # ----------------- flash attention forward ------------------------#
@@ -264,7 +443,6 @@ def _qwen2_attn_contiguous_batching_forward(
                    self.config.sliding_window) if use_sliding_windows else (-1,
                                                                             -1)
     # TODO support sliding window attention
-    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
     if is_prefilling:
     
         key_states = repeat_kv(
@@ -282,10 +460,9 @@ def _qwen2_attn_contiguous_batching_forward(
             max_kv_seq_length,
             causal=True)
     else:
-        # breakpoint()
         query_states = query_states.transpose(1,2).transpose(0,1)
 
-        attn_output = flash_attn_with_kvcache(
+        attn_output = flash_attn_with_kvcache_op(
             query_states,
             past_key_value[self.layer_idx][0],
             past_key_value[self.layer_idx][1],
@@ -298,6 +475,7 @@ def _qwen2_attn_contiguous_batching_forward(
 
     attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
     attn_output = self.o_proj(attn_output)
+    # attn_output = o_proj_op(attn_output, self.o_proj.weight)
 
     attn_weights = None
 
@@ -305,28 +483,28 @@ def _qwen2_attn_contiguous_batching_forward(
 
 
 
-def qwen2_attn_flash_forward(
-    self,
-    hidden_states: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
-    past_key_value: Optional[Cache] = None,
-    output_attentions: bool = False,
-    use_cache: bool = False,
-    **kwargs,
-):
+# def qwen2_attn_flash_forward(
+#     self,
+#     hidden_states: torch.Tensor,
+#     attention_mask: Optional[torch.Tensor] = None,
+#     position_ids: Optional[torch.LongTensor] = None,
+#     past_key_value: Optional[Cache] = None,
+#     output_attentions: bool = False,
+#     use_cache: bool = False,
+#     **kwargs,
+# ):
 
-    lmdeploy_ctx = MessageHub.get_instance('paged_attention')
+#     lmdeploy_ctx = MessageHub.get_instance('paged_attention')
     
-    if lmdeploy_is_available() and len(lmdeploy_ctx.runtime_info) > 0:
+    # if lmdeploy_is_available() and len(lmdeploy_ctx.runtime_info) > 0:
 
-        return _qwen2_attn_contiguous_batching_forward(self, hidden_states,attention_mask, position_ids,
-                                past_key_value, use_cache)
-    else:
-        return _qwen2_attn_varlen_forward(self, hidden_states,
-                                              attention_mask, position_ids,
-                                              past_key_value,
-                                              output_attentions, use_cache)
+    #     return _qwen2_attn_contiguous_batching_forward(self, hidden_states,attention_mask, position_ids,
+    #                             past_key_value, use_cache)
+    # else:
+    #     return _qwen2_attn_varlen_forward(self, hidden_states,
+    #                                           attention_mask, position_ids,
+    #                                           past_key_value,
+    #                                           output_attentions, use_cache)
 
 
 

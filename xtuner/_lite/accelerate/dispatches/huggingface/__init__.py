@@ -120,11 +120,11 @@ def _dispatch_minicpmv_forward(module):
 
 
 DISPATCH_MAP = {
-    'Qwen2RMSNorm': _dispatch_rms_norm_forward,
+    # 'Qwen2RMSNorm': _dispatch_rms_norm_forward,
     'Qwen2FlashAttention2': _dispatch_qwen2_attn_flash_forward,
     'Qwen2Attention': _dispatch_qwen2_attn_flash_forward,
     'Qwen2SdpaAttention': _dispatch_qwen2_attn_flash_forward,
-    'Qwen2ForCausalLM': _dispatch_qwen2_casual_forward,
+    # 'Qwen2ForCausalLM': _dispatch_qwen2_casual_forward,
     'InternLM2Attention': _dispatch_internlm2_varlen_attn_forward,
     'InternLM2SdpaAttention': _dispatch_internlm2_varlen_attn_forward,
     'InternLM2FlashAttention2': _dispatch_internlm2_varlen_attn_forward,
