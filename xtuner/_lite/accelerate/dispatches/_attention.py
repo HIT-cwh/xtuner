@@ -15,6 +15,14 @@ except ImportError:
     pass
 
 
+SUPPORT_FA3 = False
+try:
+    from flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func_v3
+    SUPPORT_FA3 = True
+except ImportError:
+    pass
+
+
 def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
@@ -110,17 +118,31 @@ def flash_attn_w_mask(
 
     cu_seqlens_q, cu_seqlens_k = cu_seq_lens
     max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
-    attn_output_unpad = flash_attn_varlen_func(
-        query_states,
-        key_states,
-        value_states,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_in_batch_q,
-        max_seqlen_k=max_seqlen_in_batch_k,
-        dropout_p=dropout_p,
-        causal=causal,
-        window_size=window_size)
+    if SUPPORT_FA3:
+        attn_output_unpad, _ = flash_attn_varlen_func_v3(
+            query_states, 
+            key_states, 
+            value_states, 
+            cu_seqlens_q, 
+            cu_seqlens_k, 
+            None, 
+            None, 
+            max_seqlen_in_batch_q, 
+            max_seqlen_in_batch_k,
+            causal=causal,
+            window_size=window_size)
+    else:
+        attn_output_unpad = flash_attn_varlen_func(
+            query_states,
+            key_states,
+            value_states,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_in_batch_q,
+            max_seqlen_k=max_seqlen_in_batch_k,
+            dropout_p=dropout_p,
+            causal=causal,
+            window_size=window_size)
     attn_output = pad_input(attn_output_unpad, indices_q, batch_size, q_len)
     return attn_output
 
@@ -141,18 +163,32 @@ def varlen_flash_attn(
 
     device = get_device()
     if device == 'cuda':
-        attn_output = flash_attn_varlen_func(
-            q_unpad,
-            k_unpad,
-            v_unpad,
-            cumulative_len,
-            cumulative_len,
-            max_seqlen,
-            max_seqlen,
-            dropout_p=dropout_p,
-            return_attn_probs=False,
-            causal=causal,
-            window_size=window_size)
+        if SUPPORT_FA3:
+            attn_output, _ = flash_attn_varlen_func_v3(
+                q_unpad, 
+                k_unpad, 
+                v_unpad, 
+                cumulative_len, 
+                cumulative_len, 
+                None, 
+                None, 
+                max_seqlen, 
+                max_seqlen,
+                causal=causal,
+                window_size=window_size)
+        else:
+            attn_output = flash_attn_varlen_func(
+                q_unpad,
+                k_unpad,
+                v_unpad,
+                cumulative_len,
+                cumulative_len,
+                max_seqlen,
+                max_seqlen,
+                dropout_p=dropout_p,
+                return_attn_probs=False,
+                causal=causal,
+                window_size=window_size)
         attn_output = attn_output.unsqueeze(0)
     elif device == 'npu':
         import torch_npu
