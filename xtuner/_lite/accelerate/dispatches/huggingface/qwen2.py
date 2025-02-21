@@ -214,7 +214,7 @@ def fill_kv_cache_op(
     max_q_seq_length: int,
     block_offsets: Tensor,
 ) -> None:
-    max_q_seq_length = torch.tensor(max_q_seq_length).cuda()
+    # max_q_seq_length = torch.tensor(max_q_seq_length).cuda()
     fill_kv_cache(
         key_states,
         value_states,
@@ -379,7 +379,144 @@ def flash_attn_with_kvcache_op(
     return out
 
 
+@torch.library.custom_op("attn::apply_rotary_pos_emb_op", mutates_args=())
+def apply_rotary_pos_emb_op(
+    query_states: Tensor,
+    key_states: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+) -> Tuple[Tensor, Tensor]:
+    return apply_rotary_pos_emb_lmdeploy(
+        query_states,
+        key_states,
+        cos,
+        sin)
+
+
+@apply_rotary_pos_emb_op.register_fake
+def _(
+    query_states: Tensor,
+    key_states: Tensor,
+    cos: Tensor,
+    sin: Tensor,
+) -> Tuple[Tensor, Tensor]:
+    return torch.empty_like(query_states), torch.empty_like(key_states)
+
+
+@torch.library.custom_op("attn::paged_attention_fwd_op", mutates_args=('attn_output', ))
+def paged_attention_fwd_op(
+    query_states: Tensor,
+    k_cache: Tensor,
+    v_cache: Tensor,
+    attn_output: Tensor,
+    block_offsets: Tensor,
+    q_start_loc: Tensor,
+    q_seqlens: Tensor,
+    kv_seqlens: Tensor,
+    max_seqlen: int
+) -> None:
+    paged_attention_fwd(
+        query_states,
+        k_cache,
+        v_cache,
+        attn_output,
+        block_offsets,
+        q_start_loc=q_start_loc,
+        q_seqlens=q_seqlens,
+        kv_seqlens=kv_seqlens,
+        max_seqlen=max_seqlen,
+    )
+
+
+@paged_attention_fwd_op.register_fake
+def _(
+    query_states: Tensor,
+    k_cache: Tensor,
+    v_cache: Tensor,
+    attn_output: Tensor,
+    block_offsets: Tensor,
+    q_start_loc: Tensor,
+    q_seqlens: Tensor,
+    kv_seqlens: Tensor,
+    max_seqlen: int
+) -> None:
+    return None
+
+
+from lmdeploy.pytorch.kernels import fill_kv_cache, paged_attention_fwd
+
 def qwen2_attn_flash_forward(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Cache] = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    cache_position: Optional[torch.LongTensor] = None,
+    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+    **kwargs,
+):
+    kv_seq_length = kwargs['kv_seq_length']
+    q_seq_length = kwargs['q_seq_length']
+    q_start_loc = kwargs['q_start_loc']
+    block_offsets = kwargs['block_offsets']
+    max_q_seq_length = kwargs['max_q_seq_length']
+    max_kv_seq_length = kwargs['max_kv_seq_length']
+    cumulative_length = kwargs['cumulative_length']
+    is_prefilling = kwargs['is_prefilling']
+    
+    bsz, q_len, _ = hidden_states.size()
+
+    query_states = self.q_proj(hidden_states)
+    key_states = self.k_proj(hidden_states)
+    value_states = self.v_proj(hidden_states)
+    
+    query_states = query_states.view(bsz * q_len, self.num_heads, self.head_dim)
+    key_states = key_states.view(bsz * q_len, self.num_key_value_heads, self.head_dim)
+    value_states = value_states.view(bsz * q_len, self.num_key_value_heads, self.head_dim)
+
+    if position_embeddings is None:
+        cos, sin = self.rotary_emb(value_states, position_ids)
+    else:
+        cos, sin = position_embeddings
+    
+    query_states, key_states = apply_rotary_pos_emb_op(
+        query_states,
+        key_states,
+        cos,
+        sin,)
+    
+    fill_kv_cache_op(
+        key_states,
+        value_states,
+        past_key_value[self.layer_idx][0],
+        past_key_value[self.layer_idx][1],
+        q_start_loc,
+        q_seq_length,
+        kv_seq_length=kv_seq_length,
+        max_q_seq_length=max_q_seq_length,
+        block_offsets=block_offsets,
+    )
+
+    attn_output = query_states
+    paged_attention_fwd_op(
+        query_states,
+        past_key_value[self.layer_idx][0],
+        past_key_value[self.layer_idx][1],
+        attn_output,
+        block_offsets,
+        q_start_loc=q_start_loc,
+        q_seqlens=q_seq_length,
+        kv_seqlens=kv_seq_length,
+        max_seqlen=max_q_seq_length,
+    )
+    attn_output = attn_output.reshape(*hidden_states.shape[:-1], -1)
+    attn_output = self.o_proj(attn_output)
+    return attn_output, None, past_key_value
+
+
+def qwen2_attn_flash_forward1(
     self,
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,

@@ -13,7 +13,7 @@ import copy
 
 
 tp_size = 2
-bs = 32
+bs = 256
 setup_parallel(tp_size=tp_size)
 tp_mesh = get_tp_mesh()
 
@@ -44,6 +44,6 @@ piece = 'Who are '
 token_ids = tokenizer.encode(piece, return_tensors='pt').cuda().view(1, -1)
 token_ids_list = [copy.deepcopy(token_ids) for _ in range(bs)]
 
-out = contiguous_batching_generate(model, token_ids_list, use_compile=True, max_new_tokens=300, tp_size=tp_mesh.size())
+out = contiguous_batching_generate(model, token_ids_list, use_compile=True, max_new_tokens=300, tp_size=tp_mesh.size(), max_batch_size=bs)
 print(tokenizer.decode(out[0]))
 # breakpoint()

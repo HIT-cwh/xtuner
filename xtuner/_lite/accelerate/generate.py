@@ -63,10 +63,11 @@ def contiguous_batching_generate(model,
 
     from lmdeploy.pytorch.config import CacheConfig, ModelConfig
     from lmdeploy.pytorch.engine.cache_engine import CacheEngine
-    from lmdeploy.logger import get_logger
-    get_logger('lmdeploy').setLevel('ERROR')
+    # from lmdeploy.logger import get_logger
+    # get_logger('lmdeploy').setLevel('ERROR')
 
-    block_size = 256
+    # block_size = 256
+    block_size = 128
     max_batch_size = min(max_batch_size, len(input_ids))
     num_blocks = max_length // block_size * max_batch_size
     cache_config = CacheConfig(max_batch_size, block_size, num_blocks,
@@ -106,10 +107,12 @@ def contiguous_batching_generate(model,
 
     def apply_compile(model):
         for idx, layer in enumerate(model.model.layers):
-            layer = torch.compile(layer, fullgraph=True)
+            layer = torch.compile(layer, fullgraph=True, backend="inductor")
+            # layer = torch.compile(layer, fullgraph=False, backend="cudagraphs")
             model.model.layers[idx] = layer
         # model.model.embed_tokens = torch.compile(model.model.embed_tokens, fullgraph=True)
-        model.lm_head = torch.compile(model.lm_head, fullgraph=True)
+        model.lm_head = torch.compile(model.lm_head, fullgraph=True, backend="inductor")
+        # model.lm_head = torch.compile(model.lm_head, fullgraph=False, backend="cudagraphs")
 
     if use_compile:
         apply_compile(model)
@@ -150,6 +153,9 @@ def contiguous_batching_generate(model,
             cumulative_length=next_cumulative_length,
             is_prefilling=next_is_prefilling
         )
+
+        # import torch.distributed as dist
+        # dist.breakpoint()
 
         for key in list(attn_ctx.runtime_info.keys()):
             attn_ctx.pop_info(key)
