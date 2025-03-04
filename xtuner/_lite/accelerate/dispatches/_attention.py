@@ -169,11 +169,11 @@ def varlen_flash_attn(
                 k_unpad, 
                 v_unpad, 
                 cumulative_len, 
-                cumulative_len, 
-                None, 
-                None, 
+                cumulative_len,  
                 max_seqlen, 
                 max_seqlen,
+                None, 
+                None,
                 causal=causal,
                 window_size=window_size)
         else:
