@@ -45,28 +45,29 @@ class Float8Handler:
         # Mutates the model inplace replacing instances of torch.nn.Linear with Float8Linear
         enable_fsdp_float8_all_gather = enable_fsdp_float8_all_gather
 
-        scaling_type_input = ScalingType(scaling_type_input)
-        scaling_type_weight = ScalingType(scaling_type_weight)
-        scaling_type_grad_output = ScalingType(scaling_type_grad_output)
-        scaling_granularity_gemm = ScalingGranularity(scaling_granularity_gemm)
-        self.config = Float8LinearConfig(
-            enable_fsdp_float8_all_gather=enable_fsdp_float8_all_gather,
-            cast_config_input=CastConfig(
-                scaling_type=scaling_type_input,
-                scaling_granularity=scaling_granularity_gemm,
-            ),
-            cast_config_weight=CastConfig(
-                scaling_type=scaling_type_weight,
-                scaling_granularity=scaling_granularity_gemm,
-            ),
-            cast_config_grad_output=CastConfig(
-                scaling_type=scaling_type_grad_output,
-                scaling_granularity=scaling_granularity_gemm,
-            ),
-            enable_pre_and_post_forward=False,
-            pad_inner_dim=pad_inner_dim,
-        )
+        # scaling_type_input = ScalingType(scaling_type_input)
+        # scaling_type_weight = ScalingType(scaling_type_weight)
+        # scaling_type_grad_output = ScalingType(scaling_type_grad_output)
+        # scaling_granularity_gemm = ScalingGranularity(scaling_granularity_gemm)
+        # self.config = Float8LinearConfig(
+        #     enable_fsdp_float8_all_gather=enable_fsdp_float8_all_gather,
+        #     cast_config_input=CastConfig(
+        #         scaling_type=scaling_type_input,
+        #         scaling_granularity=scaling_granularity_gemm,
+        #     ),
+        #     cast_config_weight=CastConfig(
+        #         scaling_type=scaling_type_weight,
+        #         scaling_granularity=scaling_granularity_gemm,
+        #     ),
+        #     cast_config_grad_output=CastConfig(
+        #         scaling_type=scaling_type_grad_output,
+        #         scaling_granularity=scaling_granularity_gemm,
+        #     ),
+        #     enable_pre_and_post_forward=False,
+        #     pad_inner_dim=pad_inner_dim,
+        # )
         self.scaling_granularity_grouped_gemm = scaling_granularity_grouped_gemm
+        self.scaling_granularity_gemm = scaling_granularity_gemm
 
         self.enabled = True
 
@@ -99,6 +100,7 @@ class Float8Handler:
             ChannelWiseFloat8GroupedLinear,
             TileWiseFloat8GroupedLinear,
         )
+        from xtuner._lite.accelerate.float8_gmm.float8_linear_channel_wise import ChannelWiseFloat8Linear
 
         def traverse(module):
             for name, child in module.named_children():
@@ -114,18 +116,24 @@ class Float8Handler:
                     else:
                         raise NotImplementedError
                     module.add_module(name, child)
+                elif isinstance(child, nn.Linear) and name != 'lm_head' and name != 'gate':
+                    if self.scaling_granularity_gemm == "channelwise":
+                        child = ChannelWiseFloat8Linear.from_float(child)
+                    else:
+                        raise NotImplementedError
+                    module.add_module(name, child)
                 else:
                     traverse(child)
 
         traverse(model)
 
-        from xtuner._lite.accelerate.float8_gmm import convert_to_float8_training
+        # from xtuner._lite.accelerate.float8_gmm import convert_to_float8_training
 
-        convert_to_float8_training(
-            model,
-            config=self.config,
-            module_filter_fn=lambda mod, fqn: (fqn != "lm_head" and fqn[-4:] != "gate"),
-        )
+        # convert_to_float8_training(
+        #     model,
+        #     config=self.config,
+        #     module_filter_fn=lambda mod, fqn: (fqn != "lm_head" and fqn[-4:] != "gate"),
+        # )
 
         logger.info("FP8 training enabled.")
 
