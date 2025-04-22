@@ -271,7 +271,7 @@ class ChannelWiseFloat8GroupedLinear(torch.nn.Module):
         )
 
     @classmethod
-    def from_float(cls, mod, amax_need_reduce):
+    def from_float(cls, mod):
         with torch.device("meta"):
             new_mod = cls(
                 mod.in_features,
@@ -284,7 +284,7 @@ class ChannelWiseFloat8GroupedLinear(torch.nn.Module):
                 new_mod.linear_mm_config,
                 torch.float8_e4m3fn,
                 new_mod.ori_shape,
-                amax_need_reduce=amax_need_reduce,
+                # amax_need_reduce=amax_need_reduce,
             )
         )
         return new_mod

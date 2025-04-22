@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.utils._pytree as pytree
 from torch._prims_common import suggest_memory_format
 from torch.distributed._tensor import DTensor
-from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 # from xtuner._lite.parallel import get_ep_mesh, get_experts_fsdp_mesh
 from xtuner._lite.accelerate.float8_gmm.config import ScalingGranularity
@@ -172,7 +172,7 @@ class WeightWithDynamicChannelwiseFloat8CastTensorGMM(torch.Tensor):
         linear_mm_config: LinearMMConfig,
         dtype: torch.dtype,
         ori_shape,
-        amax_need_reduce,
+        # amax_need_reduce,
         precomputed_scale: Optional[torch.Tensor] = None,
     ):
         return torch.Tensor._make_wrapper_subclass(
@@ -194,7 +194,7 @@ class WeightWithDynamicChannelwiseFloat8CastTensorGMM(torch.Tensor):
         linear_mm_config: LinearMMConfig,
         dtype: torch.dtype,
         ori_shape,
-        amax_need_reduce,
+        # amax_need_reduce,
         precomputed_scale: Optional[torch.Tensor] = None,
     ):
         self._tensor = tensor
@@ -205,7 +205,7 @@ class WeightWithDynamicChannelwiseFloat8CastTensorGMM(torch.Tensor):
         # for all float8 parameters after optimizer step
         self._precomputed_scale = precomputed_scale
         self._ori_shape = ori_shape
-        self._amax_need_reduce = amax_need_reduce
+        # self._amax_need_reduce = amax_need_reduce
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args, kwargs=None):
@@ -215,12 +215,12 @@ class WeightWithDynamicChannelwiseFloat8CastTensorGMM(torch.Tensor):
                 args[0]._linear_mm_config,
                 args[0]._dtype,
                 args[0]._ori_shape,
-                args[0]._amax_need_reduce,
+                # args[0]._amax_need_reduce,
             )
         mm_config: Optional[LinearMMConfig] = None
         dtype: Optional[torch.dtype] = None
         ori_shape: Optional[tuple] = None
-        amax_need_reduce: Optional[LinearMMConfig] = None
+        # amax_need_reduce: Optional[LinearMMConfig] = None
 
         def unwrap(t):
             nonlocal mm_config
@@ -235,8 +235,8 @@ class WeightWithDynamicChannelwiseFloat8CastTensorGMM(torch.Tensor):
                 assert t._dtype == dtype
             nonlocal ori_shape
             ori_shape = t._ori_shape
-            nonlocal amax_need_reduce
-            amax_need_reduce = t._amax_need_reduce
+            # nonlocal amax_need_reduce
+            # amax_need_reduce = t._amax_need_reduce
             return t._tensor
 
         args, kwargs = pytree.tree_map_only(
@@ -250,7 +250,7 @@ class WeightWithDynamicChannelwiseFloat8CastTensorGMM(torch.Tensor):
         return pytree.tree_map_only(
             torch.Tensor,
             lambda x: WeightWithDynamicChannelwiseFloat8CastTensorGMM(
-                x, mm_config, dtype, ori_shape, amax_need_reduce
+                x, mm_config, dtype, ori_shape, #amax_need_reduce
             ),
             out,
         )
@@ -263,7 +263,7 @@ class WeightWithDynamicChannelwiseFloat8CastTensorGMM(torch.Tensor):
             "mm_config": self._linear_mm_config,
             "dtype": self._dtype,
             "ori_shape": self._ori_shape,
-            "amax_need_reduce": self._amax_need_reduce,
+            # "amax_need_reduce": self._amax_need_reduce,
         }
 
     @staticmethod
@@ -273,7 +273,7 @@ class WeightWithDynamicChannelwiseFloat8CastTensorGMM(torch.Tensor):
             flatten_spec["mm_config"],
             flatten_spec["dtype"],
             ori_shape=flatten_spec["ori_shape"],
-            amax_need_reduce=flatten_spec["amax_need_reduce"],
+            # amax_need_reduce=flatten_spec["amax_need_reduce"],
             precomputed_scale=getattr(inner_tensors, "_precomputed_scale", None),
         )
 
@@ -295,7 +295,12 @@ class WeightWithDynamicChannelwiseFloat8CastTensorGMM(torch.Tensor):
             )
         else:
             ori_shard_shape = self._tensor.shape
-            if self._amax_need_reduce:
+            if ori_shard_shape[0] < self._ori_shape[1]:
+                # need reduce amax
+                assert self._ori_shape[1] % ori_shard_shape[0] == 0, \
+                    'WeightWithDynamicChannelwiseFloat8CastTensorGMM get '\
+                    f'self._ori_shape = {self._ori_shape}, self._tensor.shape = {self._tensor.shape}.'
+                assert _W2_REDUCE_MESH is not None
                 float8_tensor = my_hp_tensor_to_float8_dynamic(
                     self._tensor,
                     self._dtype,
@@ -306,6 +311,10 @@ class WeightWithDynamicChannelwiseFloat8CastTensorGMM(torch.Tensor):
                 )
                 float8_tensor._scale = float8_tensor._scale.view(-1, 1, 1)
             else:
+                # dont need reduce amax
+                assert ori_shard_shape[0] % self._ori_shape[1] == 0, \
+                    'WeightWithDynamicChannelwiseFloat8CastTensorGMM get '\
+                    f'self._ori_shape = {self._ori_shape}, self._tensor.shape = {self._tensor.shape}.'
                 tensor_viewed = self._tensor.view(
                     -1, self._ori_shape[1] * self._ori_shape[2]
                 )
@@ -333,7 +342,7 @@ class WeightWithDynamicChannelwiseFloat8CastTensorGMM(torch.Tensor):
         out: Optional[torch.Tensor] = None,
     ):
         data, scale = all_gather_outputs
-        if self._amax_need_reduce:
+        if _W2_REDUCE_MESH is not None:
             # 多个 fsdp rank shard 同一个 expert 的权重，reduce 后这些 rank 的 scale all gather 后是重复的，需要删除
             scale_used = scale.view(
                 scale.shape[0] // _W2_REDUCE_MESH.size(),
@@ -366,26 +375,48 @@ class WeightWithDynamicChannelwiseFloat8CastTensorGMM(torch.Tensor):
         ), (data, scale)
 
 
-@torch.compile(fullgraph=True)
-def cast_to_per_block_fp8(w, float8_dtype):
+from torch.distributed._functional_collectives import AsyncCollectiveTensor, all_reduce
+# @torch.compile(fullgraph=True)
+def cast_to_per_block_fp8(w, float8_dtype, reduce_amax=False, reduce_group=None):
     dout, din = w.shape
     block_size = 128
-    w = (
-        w.view(dout // block_size, block_size, din // block_size, block_size)
-        .transpose(1, 2)
-        .reshape(-1, block_size * block_size)
-    )
-    w_amax = w.abs().amax(-1, True)
-    w_scale = w_amax.float() / torch.finfo(float8_dtype).max
-    w_scaled = w.float() / w_scale
+
+    # tensor_to_block_wise_amax
+    if reduce_amax:
+        assert reduce_group is not None
+        assert dout < block_size and block_size % dout == 0, f'dout = {dout}'
+        w = w.view(dout, din // block_size, block_size).transpose(0, 1).reshape(din // block_size, -1)
+        w_amax = w.abs().amax(-1, True)
+        w_amax = all_reduce(w_amax, "MAX", reduce_group)
+        if isinstance(w_amax, AsyncCollectiveTensor):
+            w_amax = w_amax.wait()
+    else:
+        w = (
+            w.view(dout // block_size, block_size, din // block_size, block_size)
+            .transpose(1, 2)
+            .reshape(-1, block_size * block_size)
+        )
+        w_amax = w.abs().amax(-1, True)
+    
+    # block_wise_amax_to_scale
+    w_amax = w_amax.to(torch.float64)
+    w_scales = torch.clamp(w_amax, min=EPS) / torch.finfo(float8_dtype).max
+
+    # cast to fp8
+    w_scaled = w.to(torch.float32) / w_scales
     w_bits_fp8 = to_fp8_saturated(w_scaled, float8_dtype)
-    w_bits_fp8 = (
-        w_bits_fp8.view(dout // block_size, din // block_size, block_size, block_size)
-        .transpose(1, 2)
-        .reshape(dout, din)
-    )
-    w_scale = w_scale.view(dout // block_size, din // block_size)
-    return w_bits_fp8, w_scale
+
+    if reduce_amax:
+        w_bits_fp8 = w_bits_fp8.view(din // block_size, dout, block_size).transpose(0, 1).reshape(dout, din)
+        w_scales = w_scales.view(1, din // block_size).contiguous()
+    else:
+        w_bits_fp8 = (
+            w_bits_fp8.view(dout // block_size, din // block_size, block_size, block_size)
+            .transpose(1, 2)
+            .reshape(dout, din)
+        )
+        w_scales = w_scales.view(dout // block_size, din // block_size).contiguous()
+    return w_bits_fp8, w_scales
 
 
 class weight_to_per_block_float8_dynamic(torch.autograd.Function):
@@ -396,8 +427,10 @@ class weight_to_per_block_float8_dynamic(torch.autograd.Function):
         float8_dtype: torch.dtype,
         linear_mm_config,
         gemm_input_role=GemmInputRole.WEIGHT,
+        reduce_amax=False, 
+        reduce_group=None,
     ):
-        w_bits_fp8, w_scale = cast_to_per_block_fp8(w, float8_dtype)
+        w_bits_fp8, w_scale = cast_to_per_block_fp8(w, float8_dtype, reduce_amax, reduce_group)
 
         return Float8Tensor(
             w_bits_fp8,
@@ -409,10 +442,227 @@ class weight_to_per_block_float8_dynamic(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, g):
-        return g, None, None, None
+        return g, None, None, None, None, None
+
+
+tilewise_fp8_group_mapping = dict()
+
+
+def set_tilewise_fp8_reduce_group(ori_shape, local_shape, fsdp_size, ep_size, shard_dim=0):
+    # local_shape 不是 param._local_tensor.shape 而是 param._sharded_param_data.shape
+    # 在 /cpfs01/shared/llm_razor/caoweihan/projects/xtuner_xpuyu_new/xtuner/xtuner/_lite/patches/torch.py 里
+    # 我们对 param._sharded_param_data 做了特殊处理保证通过 _chunk_with_empty得到的
+    # fsdp 切过的 param._sharded_param_data 的 shape 能被 128 block wise fp8 处理
+    local_shape = (local_shape[0] // ori_shape[-1], ori_shape[-1])
+    assert local_shape[shard_dim] % 128 == 0 or 128 % local_shape[shard_dim] == 0
+    assert shard_dim == 0, f'Currently only fsdp shard_dim 0 is supported, got {shard_dim}'
+    if local_shape[shard_dim] % 128 == 0:
+        # fsdp 切过之后的 shard_dim size 是 128 的倍数，不需要 reduce
+        return
+    assert fsdp_size * ep_size == dist.get_world_size(), 'Currently, only fsdp and ep is supported.'
+    reduce_world_size = 128 // local_shape[shard_dim]
+    global tilewise_fp8_group_mapping
+    # 相同的 ori_shape 可能对应不同的 local_shape，因为 fsdp mesh 可能不一样
+    # 例如 dense 部分的 ori_shape 可能和 moe 部分的 某个 grouped linear 一样
+    dist.breakpoint()
+    if ori_shape in tilewise_fp8_group_mapping:
+        assert dist.get_world_size(group=tilewise_fp8_group_mapping[ori_shape]) == reduce_world_size
+        return
+    
+    world_mesh = init_device_mesh('cuda', (fsdp_size // reduce_world_size, reduce_world_size, ep_size), mesh_dim_names=['_', 'tilewise_reduce', 'ep'])
+    tilewise_fp8_group_mapping[ori_shape] = world_mesh.get_group(1)
+    return
+
+
+def get_tilewise_fp8_reduce_group(ori_shape):
+    # assert ori_shape in tilewise_fp8_group_mapping, \
+    #     f'rank {dist.get_rank()}, ori_shape = {ori_shape} is '\
+    #     f'not in tilewise_fp8_group_mapping'
+    return tilewise_fp8_group_mapping.get(ori_shape, None)
+    # return tilewise_fp8_group_mapping[ori_shape]
+
+
+class WeightWithDynamicTilewiseFloat8CastTensor(torch.Tensor):
+    def __new__(
+        cls,
+        tensor: torch.Tensor,
+        linear_mm_config: LinearMMConfig,
+        dtype: torch.dtype,
+        ori_shape,
+        precomputed_scale: Optional[torch.Tensor] = None,
+    ):
+        return torch.Tensor._make_wrapper_subclass(
+            cls,
+            tensor.size(),
+            strides=tensor.stride(),
+            storage_offset=tensor.storage_offset(),
+            memory_format=suggest_memory_format(tensor),
+            dtype=tensor.dtype,
+            layout=tensor.layout,
+            device=tensor.device,
+            pin_memory=tensor.is_pinned(),
+            requires_grad=tensor.requires_grad,
+        )
+
+    def __init__(
+        self,
+        tensor: torch.Tensor,
+        linear_mm_config: LinearMMConfig,
+        dtype: torch.dtype,
+        ori_shape,
+        precomputed_scale: Optional[torch.Tensor] = None,
+    ):
+        self._tensor = tensor
+        self._linear_mm_config = linear_mm_config
+        self._dtype = dtype
+        # for dynamic scaling
+        # `precompute_float8_dynamic_scale_for_fsdp` calculates scales
+        # for all float8 parameters after optimizer step
+        self._precomputed_scale = precomputed_scale
+        self._ori_shape = ori_shape
+
+        # useful when weight.numel is not divisible by the gpu number
+        self._use_padded_sharded_param_all_gather = True
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args, kwargs=None):
+        if func == torch.ops.aten.detach.default:
+            return WeightWithDynamicTilewiseFloat8CastTensor(
+                args[0]._tensor,
+                args[0]._linear_mm_config,
+                args[0]._dtype,
+                args[0]._ori_shape,
+            )
+        mm_config: Optional[LinearMMConfig] = None
+        dtype: Optional[torch.dtype] = None
+        ori_shape: Optional[tuple] = None
+
+        def unwrap(t):
+            nonlocal mm_config
+            if mm_config is None:
+                mm_config = t._linear_mm_config
+            else:
+                assert t._linear_mm_config == mm_config
+            nonlocal dtype
+            if dtype is None:
+                dtype = t._dtype
+            else:
+                assert t._dtype == dtype
+            nonlocal ori_shape
+            ori_shape = t._ori_shape
+            return t._tensor
+
+        args, kwargs = pytree.tree_map_only(
+            WeightWithDynamicTilewiseFloat8CastTensor, unwrap, (args, kwargs or {})
+        )
+        out = func(*args, **kwargs)
+        if func not in _ops_to_preserve_subclass:
+            return out
+        return pytree.tree_map_only(
+            torch.Tensor,
+            lambda x: WeightWithDynamicTilewiseFloat8CastTensor(
+                x, mm_config, dtype, ori_shape
+            ),
+            out,
+        )
+
+    def __tensor_flatten__(self):
+        tensors = ["_tensor"]
+        if self._precomputed_scale:
+            tensors.append("_precomputed_scale")
+        return tensors, {
+            "mm_config": self._linear_mm_config,
+            "dtype": self._dtype,
+            "ori_shape": self._ori_shape,
+        }
+
+    @staticmethod
+    def __tensor_unflatten__(inner_tensors, flatten_spec, outer_size, outer_stride):
+        return WeightWithDynamicTilewiseFloat8CastTensor(
+            inner_tensors["_tensor"],
+            flatten_spec["mm_config"],
+            flatten_spec["dtype"],
+            flatten_spec["ori_shape"],
+            getattr(inner_tensors, "_precomputed_scale", None),
+        )
+
+    def __repr__(self):
+        return (
+            f"WeightWithDynamicTilewiseFloat8CastTensor(tensor={self._tensor}, "
+            f"linear_mm_config={self._linear_mm_config}, dtype={self._dtype})"
+        )
+
+    def fsdp_pre_all_gather(self, mesh): 
+        # dist.breakpoint()
+        tensor = self._tensor.view(-1, self._ori_shape[-1])
+        if self._precomputed_scale is not None:
+            raise NotImplementedError
+        else:
+            if tensor.shape[0] >= 128:
+                assert tensor.shape[0] % 128 == 0
+                float8_tensor = weight_to_per_block_float8_dynamic.apply(
+                    tensor, torch.float8_e4m3fn, self._linear_mm_config,
+                )
+            else:
+                assert 128 % tensor.shape[0] == 0
+                reduce_group = get_tilewise_fp8_reduce_group(self._ori_shape)
+                assert reduce_group is not None, \
+                    f'rank {dist.get_rank()}, ori_shape = {self._ori_shape} is '\
+                    f'not in tilewise_fp8_group_mapping'
+                float8_tensor = weight_to_per_block_float8_dynamic.apply(
+                    tensor, torch.float8_e4m3fn, self._linear_mm_config,
+                    GemmInputRole.WEIGHT, True, reduce_group
+                )
+        
+        return (float8_tensor._data.view(-1), float8_tensor._scale.view(-1)), None
+
+    def fsdp_post_all_gather(
+        self,
+        all_gather_outputs: Tuple[torch.Tensor, ...],
+        metadata: Any,
+        param_dtype: torch.dtype,
+        *,
+        out: Optional[torch.Tensor] = None,
+    ):
+        tensor = self._tensor.view(-1, self._ori_shape[-1])
+        if tensor.shape[0] < 128:
+            # 算 amax 的时候已经做了 reduce max，all gather 得到了不同 rank 上重复的 scales
+            # 需要 slice 掉
+            reduce_group = get_tilewise_fp8_reduce_group(self._ori_shape)
+            assert reduce_group is not None
+            reduce_world_size = dist.get_world_size(reduce_group)
+            assert 128 // tensor.shape[0] == reduce_world_size, \
+                f'WeightWithDynamicTilewiseFloat8CastTensor.fsdp_post_all_gather, ' \
+                f'tensor.shape[0] = {tensor.shape[0]}, reduce_world_size = {reduce_world_size}'
+            # 考虑 expert_fsdp_mesh 导致的 scale all gather 问题
+            
+        dist.breakpoint()
+        data, scale = all_gather_outputs
+        if out is not None:
+            from torch.distributed._tensor import DTensor
+
+            if isinstance(out, Float8Tensor):
+                out._scale = scale
+            elif isinstance(out, DTensor) and isinstance(
+                out._local_tensor, Float8Tensor
+            ):
+                out._local_tensor._scale = scale
+            else:
+                raise RuntimeError(
+                    f"out must be a Float8Tensor or DTensor(_local_tensor=Float8Tensor), but got {out}"
+                )
+            return
+        return Float8Tensor(
+            data,
+            scale,
+            param_dtype,
+            self._linear_mm_config,
+            gemm_input_role=GemmInputRole.WEIGHT,
+        ), (data, scale)
 
 
 class WeightWithDynamicTilewiseFloat8CastTensorGMM(torch.Tensor):
+
     def __new__(
         cls,
         tensor: torch.Tensor,
@@ -518,12 +768,13 @@ class WeightWithDynamicTilewiseFloat8CastTensorGMM(torch.Tensor):
             f"WeightWithDynamicTilewiseFloat8CastTensorGMM(tensor={self._tensor}, "
             f"linear_mm_config={self._linear_mm_config}, dtype={self._dtype})"
         )
-
+    
     def fsdp_pre_all_gather(self, mesh):
+        # todo: 支持任意卡训练，目前优先支持 linear 的任意卡训练
         if self._precomputed_scale is not None:
             raise NotImplementedError
         else:
-            assert self._tensor.shape[0] > 128 and (
+            assert self._tensor.shape[0] >= 128 and (
                 self._tensor.shape[0] % 128 == 0
             ), f"{self._tensor.shape}"
             float8_tensor = weight_to_per_block_float8_dynamic.apply(

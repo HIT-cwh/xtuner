@@ -204,6 +204,10 @@ class fp8_matmul_weight_per_block_act_per_tile(torch.autograd.Function):
             tokens_per_expert_expand,
         ) = trans_per_tile_quant_expand_128x(grad_output_hp, tokens_per_expert)
         dw = grad_output_hp.new_empty((ne, dout, din))
+
+        # import torch.distributed as dist
+        # dist.breakpoint()
+
         k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
             grad_out_trans_fp8,
             grad_out_trans_scale,
@@ -285,7 +289,7 @@ class TileWiseFloat8GroupedLinear(torch.nn.Module):
         )
 
     @classmethod
-    def from_float(cls, mod, amax_need_reduce):
+    def from_float(cls, mod):
         with torch.device("meta"):
             new_mod = cls(
                 mod.in_features,

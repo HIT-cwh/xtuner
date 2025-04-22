@@ -2,6 +2,7 @@
 import inspect
 from functools import wraps
 from typing import List, cast
+import math
 
 import torch
 from mmengine.utils import digit_version, import_modules_from_strings
@@ -136,3 +137,41 @@ def dispatch_torch_fsdp_param():
 
         logger.info("dispatch_torch_fsdp_param")
         FSDPParam.all_gather_inputs = property(all_gather_inputs)
+
+
+def chunk_with_empty(
+    tensor: torch.Tensor, num_chunks: int, dim: int
+) -> List[torch.Tensor]:
+    total_size = tensor.size(dim)
+    base_size = 128  # fp8 block_size is 128
+
+    ideal_chunk_size = math.ceil(total_size / num_chunks)
+
+    if ideal_chunk_size > base_size:
+        # 如果大于base_size，调整到base_size的倍数
+        chunk_size = math.ceil(ideal_chunk_size / base_size) * base_size
+    else:
+        # 如果小于base_size，找到最大的能整除base_size的数
+        factors = [1, 2, 4, 8, 16, 32, 64, 128]
+        chunk_size = next(size for size in factors if size >= ideal_chunk_size)
+    
+    chunks = torch.split(tensor, chunk_size, dim=dim)
+    chunks = list(chunks)
+    while len(chunks) < num_chunks:
+        chunks.append(chunks[0].new_empty(0))
+    return chunks
+
+
+def dispatch_torch_fsdp_chunk_with_empty():
+    # fsdp 切完参数后，shard dim 的长度如果不是 128 的倍数也不是 128 的因数
+    # 很难对其使用 per block fp8 量化
+    # 需要保证 fsdp 切完参数后，shard dim 的长度如果是 128 的倍数或 128 的因数
+    # 在 pt26 , torch/distributed/fsdp/_fully_shard/_fsdp_common.py 中的 _chunk_with_empty
+    # 只在 torch/distributed/fsdp/_fully_shard/_fsdp_param.py 中用过两次：
+    # _init_sharded_param 和 _init_sharded_post_forward_param_metadata
+    # **在支持其他版本时务必重点检查 _chunk_with_empty 这个函数的使用情况**
+    if digit_version(torch.__version__)[:2] == (2, 6):
+        logger.info("dispatch_torch_fsdp_chunk_with_empty")
+        module = import_modules_from_strings("torch.distributed.fsdp._fully_shard._fsdp_common")
+        if hasattr(module, "_chunk_with_empty"):
+            module._chunk_with_empty = chunk_with_empty

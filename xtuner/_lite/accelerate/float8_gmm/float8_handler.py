@@ -86,7 +86,7 @@ class Float8Handler:
         self.compile = compile
 
     def convert_to_float8_training(
-        self, model: nn.Module, amax_need_reduce: bool = False
+        self, model: nn.Module, #amax_need_reduce: bool = False
     ):
         """This function converts the linear layers of `model` to
         `Float8Linear`.
@@ -101,17 +101,18 @@ class Float8Handler:
             TileWiseFloat8GroupedLinear,
         )
         from xtuner._lite.accelerate.float8_gmm.float8_linear_channel_wise import ChannelWiseFloat8Linear
+        from xtuner._lite.accelerate.float8_gmm.float8_linear_tile_wise import TileWiseFloat8Linear
 
         def traverse(module):
             for name, child in module.named_children():
                 if type(child).__name__ == "GroupedLinear":
                     if self.scaling_granularity_grouped_gemm == "channelwise":
                         child = ChannelWiseFloat8GroupedLinear.from_float(
-                            child, amax_need_reduce
+                            child#, amax_need_reduce
                         )
                     elif self.scaling_granularity_grouped_gemm == "tilewise":
                         child = TileWiseFloat8GroupedLinear.from_float(
-                            child, amax_need_reduce
+                            child#, amax_need_reduce
                         )
                     else:
                         raise NotImplementedError
@@ -119,6 +120,8 @@ class Float8Handler:
                 elif isinstance(child, nn.Linear) and name != 'lm_head' and name != 'gate':
                     if self.scaling_granularity_gemm == "channelwise":
                         child = ChannelWiseFloat8Linear.from_float(child)
+                    elif self.scaling_granularity_gemm == "tilewise":
+                        child = TileWiseFloat8Linear.from_float(child)
                     else:
                         raise NotImplementedError
                     module.add_module(name, child)
