@@ -29,6 +29,7 @@ from xtuner._lite.accelerate.float8_gmm.fsdp_utils import (
 from xtuner._lite.accelerate.float8_gmm.fsdp_utils import (
     WeightWithDynamicTilewiseFloat8CastTensor,
 )
+import torch.distributed as dist
 
 
 
@@ -38,11 +39,16 @@ try:
     from deep_gemm import (
         k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous,
         m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous,
+        gemm_fp8_fp8_bf16_nt,
     )
 
     DEEPGEMM_INSTALLED = True
 except ImportError:
     deep_gemm = None
+
+
+def _get_min_alignment(size: int, alignment_value: int) -> int:
+    return (1 + ((size - 1) // alignment_value)) * alignment_value
 
 
 @torch.no_grad()
@@ -141,18 +147,17 @@ class fp8_matmul_weight_per_block_act_per_tile(torch.autograd.Function):
 
         assert x.shape[0] == 1
         x = x.squeeze(0)
+        seq, din = x.shape
 
         x_fp8, x_scale = per_tile_quant(x)
         x_trans_fp8, x_trans_scale = per_block_trans_quant(x)
 
-        w_fp8_data = w_fp8._data.unsqueeze(0)
-        w_fp8_scale = w_fp8._scale.unsqueeze(0)
-        tokens_per_expert = torch.tensor([x.shape[0]], device=x.device, dtype=torch.long)
-
-        out = m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(
-            (x_fp8, x_scale),
-            (w_fp8_data, w_fp8_scale),
-            tokens_per_expert,
+        dout = w_fp8._data.shape[0]
+        out = x.new_empty((seq, dout))
+        gemm_fp8_fp8_bf16_nt(
+            x_fp8, x_scale,
+            w_fp8._data, w_fp8._scale,
+            out
         )
 
         ctx.save_for_backward(
@@ -164,7 +169,6 @@ class fp8_matmul_weight_per_block_act_per_tile(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output_hp):
-
         assert grad_output_hp.shape[0] == 1
         grad_output_hp = grad_output_hp.squeeze(0)
         (
@@ -172,37 +176,34 @@ class fp8_matmul_weight_per_block_act_per_tile(torch.autograd.Function):
             x_trans_scale,
             w_fp8,
         ) = ctx.saved_tensors
-        tokens_per_expert = torch.tensor([grad_output_hp.shape[0]], device=grad_output_hp.device, dtype=torch.long)
-
+        
         dout, din = w_fp8.shape
-        grad_out_fp8, grad_out_scale = per_tile_quant(grad_output_hp)
-        dx = m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(
-            (grad_out_fp8, grad_out_scale),
-            (
-                w_fp8._data.unsqueeze(0).transpose(1, 2).contiguous(),
-                w_fp8._scale.unsqueeze(0).transpose(1, 2).contiguous(),
-            ),
-            tokens_per_expert,
+        seq, dout = grad_output_hp.shape
+
+        if dout % 128 != 0:
+            dout_pad = _get_min_alignment(dout, 128)
+            grad_output_hp_pad = torch.nn.functional.pad(grad_output_hp, (0, dout_pad - dout, 0, 0))
+            w_fp8_data = torch.nn.functional.pad(w_fp8._data.transpose(0, 1).contiguous(), (0, dout_pad - dout, 0, 0))
+        else:
+            grad_output_hp_pad = grad_output_hp
+            w_fp8_data = w_fp8._data.transpose(0, 1).contiguous()
+        w_fp8_scale = w_fp8._scale.transpose(0, 1).contiguous()
+
+        grad_out_pad_fp8, grad_out_pad_scale = per_tile_quant(grad_output_hp_pad)
+        dx = grad_output_hp_pad.new_empty((seq, din))
+        gemm_fp8_fp8_bf16_nt(
+            grad_out_pad_fp8, grad_out_pad_scale,
+            w_fp8_data, w_fp8_scale,
+            dx
         )
         dx = dx.unsqueeze(0)
 
         grad_out_trans_fp8, grad_out_trans_scale = per_tile_trans_quant(grad_output_hp)
-        # dw = grad_output_hp.new_empty((1, dout, din))
-
-        # k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
-        #     grad_out_trans_fp8,
-        #     grad_out_trans_scale,
-        #     x_trans_fp8,
-        #     x_trans_scale,
-        #     dw,
-        #     tokens_per_expert.int(),
-        # )
-        # dw = dw.squeeze(0)
-
-        dw = m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(
-            (grad_out_trans_fp8, grad_out_trans_scale),
-            (x_trans_fp8.unsqueeze(0), x_trans_scale.unsqueeze(0)),
-            tokens_per_expert,
+        dw = grad_output_hp.new_empty((dout, din))
+        gemm_fp8_fp8_bf16_nt(
+            grad_out_trans_fp8, grad_out_trans_scale,
+            x_trans_fp8, x_trans_scale.contiguous(),
+            dw
         )
 
         return dx, dw, None, None, None

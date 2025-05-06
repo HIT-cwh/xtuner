@@ -376,7 +376,7 @@ class WeightWithDynamicChannelwiseFloat8CastTensorGMM(torch.Tensor):
 
 
 from torch.distributed._functional_collectives import AsyncCollectiveTensor, all_reduce
-# @torch.compile(fullgraph=True)
+@torch.compile(fullgraph=True)
 def cast_to_per_block_fp8(w, float8_dtype, reduce_amax=False, reduce_group=None):
     dout, din = w.shape
     block_size = 128
@@ -401,6 +401,7 @@ def cast_to_per_block_fp8(w, float8_dtype, reduce_amax=False, reduce_group=None)
     # block_wise_amax_to_scale
     w_amax = w_amax.to(torch.float64)
     w_scales = torch.clamp(w_amax, min=EPS) / torch.finfo(float8_dtype).max
+    w_scales = w_scales.to(torch.float32)
 
     # cast to fp8
     w_scaled = w.to(torch.float32) / w_scales
@@ -454,7 +455,7 @@ def set_tilewise_fp8_reduce_group(ori_shape, local_shape, fsdp_size, ep_size, sh
     # 我们对 param._sharded_param_data 做了特殊处理保证通过 _chunk_with_empty得到的
     # fsdp 切过的 param._sharded_param_data 的 shape 能被 128 block wise fp8 处理
     local_shape = (local_shape[0] // ori_shape[-1], ori_shape[-1])
-    assert local_shape[shard_dim] % 128 == 0 or 128 % local_shape[shard_dim] == 0
+    assert local_shape[shard_dim] % 128 == 0 or 128 % local_shape[shard_dim] == 0, f'{local_shape}'
     assert shard_dim == 0, f'Currently only fsdp shard_dim 0 is supported, got {shard_dim}'
     if local_shape[shard_dim] % 128 == 0:
         # fsdp 切过之后的 shard_dim size 是 128 的倍数，不需要 reduce
@@ -464,7 +465,6 @@ def set_tilewise_fp8_reduce_group(ori_shape, local_shape, fsdp_size, ep_size, sh
     global tilewise_fp8_group_mapping
     # 相同的 ori_shape 可能对应不同的 local_shape，因为 fsdp mesh 可能不一样
     # 例如 dense 部分的 ori_shape 可能和 moe 部分的 某个 grouped linear 一样
-    dist.breakpoint()
     if ori_shape in tilewise_fp8_group_mapping:
         assert dist.get_world_size(group=tilewise_fp8_group_mapping[ori_shape]) == reduce_world_size
         return
@@ -520,6 +520,8 @@ class WeightWithDynamicTilewiseFloat8CastTensor(torch.Tensor):
         # for all float8 parameters after optimizer step
         self._precomputed_scale = precomputed_scale
         self._ori_shape = ori_shape
+        if self._ori_shape[1] % 128 != 0:
+            raise NotImplementedError('Currently only din % 128 == 0 is supported.')
 
         # useful when weight.numel is not divisible by the gpu number
         self._use_padded_sharded_param_all_gather = True
@@ -624,6 +626,7 @@ class WeightWithDynamicTilewiseFloat8CastTensor(torch.Tensor):
         *,
         out: Optional[torch.Tensor] = None,
     ):
+        data, scale = all_gather_outputs
         tensor = self._tensor.view(-1, self._ori_shape[-1])
         if tensor.shape[0] < 128:
             # 算 amax 的时候已经做了 reduce max，all gather 得到了不同 rank 上重复的 scales
@@ -634,10 +637,16 @@ class WeightWithDynamicTilewiseFloat8CastTensor(torch.Tensor):
             assert 128 // tensor.shape[0] == reduce_world_size, \
                 f'WeightWithDynamicTilewiseFloat8CastTensor.fsdp_post_all_gather, ' \
                 f'tensor.shape[0] = {tensor.shape[0]}, reduce_world_size = {reduce_world_size}'
-            # 考虑 expert_fsdp_mesh 导致的 scale all gather 问题
-            
-        dist.breakpoint()
-        data, scale = all_gather_outputs
+            scale = scale.view(-1, reduce_world_size, self._ori_shape[1] // 128)
+            scale = scale[:, 0]
+
+        scale = scale.view(-1, self._ori_shape[1] // 128)
+        # 需要把 pad 部分对应的 scale slice 掉
+        scale_dim0 = math.ceil(self._ori_shape[0] / 128)
+        scale = scale[:scale_dim0]
+        scale = scale.contiguous()
+        # dist.breakpoint()
+        
         if out is not None:
             from torch.distributed._tensor import DTensor
 
