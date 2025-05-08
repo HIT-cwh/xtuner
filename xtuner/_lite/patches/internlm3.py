@@ -5,6 +5,7 @@ from xtuner._lite.modelings.internlm3.modeling_internlm3 import (
     InternLM3DecoderLayer,
     InternLM3ForCausalLM,
     InternLM3RotaryEmbedding,
+    InternLM3RMSNorm,
 )
 
 from .llama import CUDAPatchedLlamaForCausalLM
@@ -13,6 +14,7 @@ from .llama import CUDAPatchedLlamaForCausalLM
 class CUDAPatchedInternLM3ForCausalLM(CUDAPatchedLlamaForCausalLM):
     rotary_emb_cls = InternLM3RotaryEmbedding
     attn_cls = InternLM3Attention
+    norm_cls = InternLM3RMSNorm
     layer_cls = InternLM3DecoderLayer
     causal_cls = InternLM3ForCausalLM
 

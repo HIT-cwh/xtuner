@@ -66,6 +66,7 @@ from xtuner._lite.patches.base import (
 from xtuner._lite.patches.mixins import GenerateMixin
 from xtuner._lite.patches.utils import pad_to_max_length, pad_to_multiple_of
 from xtuner._lite.utils.misc import XTUNER_DETERMINISTIC
+from xtuner._lite.accelerate.ops.rms_norm import rms_norm_fn
 
 logger = logging.get_logger(__name__)
 
@@ -331,6 +332,8 @@ class CUDAPatchedLlamaForCausalLM(PatchedCausalLM, GenerateMixin):
                 module.forward = types.MethodType(cls.patched_casual_forward, module)
             if isinstance(module, cls.layer_cls):
                 module.forward = types.MethodType(cls.patched_layer_forward, module)
+            if isinstance(module, cls.norm_cls):
+                module.forward = types.MethodType(cls.patched_rms_norm_forward, module)
 
         return model
 
@@ -509,6 +512,32 @@ class CUDAPatchedLlamaForCausalLM(PatchedCausalLM, GenerateMixin):
             offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
         )
 
+        if self._fsdp_config.enable_fp8 and self._fsdp_config.scaling_granularity_gemm == 'tilewise':
+            from xtuner._lite.accelerate.float8_gmm.float8_linear_tile_wise import TileWiseFloat8Linear
+            from xtuner._lite.accelerate.float8_gmm.fsdp_utils import set_tilewise_fp8_reduce_group
+            from torch.distributed.fsdp._fully_shard import FSDPModule
+            fsdp_modules = [module for module in self.patched_model.modules() if isinstance(module, FSDPModule)]
+            for fsdp_module in fsdp_modules:
+                for fsdp_param in fsdp_module._get_fsdp_state()._fsdp_param_group.fsdp_params:
+                    if isinstance(fsdp_param._module_info.module, TileWiseFloat8Linear):
+                        set_tilewise_fp8_reduce_group(
+                            ori_shape=fsdp_param.sharded_param.shape,  # sharded_param 是 fsdp_param._module_info.module.weight
+                            local_shape=fsdp_param._sharded_param_data.shape,  # _sharded_param_data 是 padded_sharded_param.view(-1) 得到的
+                            fsdp_size=self.fsdp_mesh.size(), 
+                            ep_size=1,
+                            shard_dim=0)
+                        logger.info(
+                            f'ori_shape={fsdp_param.sharded_param.shape}, '
+                            f'local_shape={fsdp_param._sharded_param_data.shape}')
+
+    
+    @staticmethod
+    def patched_rms_norm_forward(
+        self: LlamaRMSNorm,
+        hidden_states: torch.Tensor,
+    ):
+        return rms_norm_fn(hidden_states, self.weight, None, eps=self.variance_epsilon)
+    
     @staticmethod
     def patched_attn_forward(
         self: LlamaAttention,
