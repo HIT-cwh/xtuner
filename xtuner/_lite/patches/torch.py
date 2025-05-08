@@ -155,7 +155,6 @@ def chunk_with_empty(
         factors = [1, 2, 4, 8, 16, 32, 64, 128]
         chunk_size = next(size for size in factors if size >= ideal_chunk_size)
     
-    logger.info(f'tensor.shape = {tensor.shape} chunk_size = {chunk_size}')
     chunks = torch.split(tensor, chunk_size, dim=dim)
     chunks = list(chunks)
     while len(chunks) < num_chunks:
