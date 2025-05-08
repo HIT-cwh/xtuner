@@ -10,82 +10,132 @@ from xtuner._lite.accelerate.float8_gmm.float8_utils import to_fp8_saturated
 
 
 @triton.jit
+def get_group_id(m, group_offsets, g_start, num_experts):
+    id = 0
+    off_out = 0
+    offnxt_out = 0
+    for group_id in tl.range(g_start, num_experts):
+        group_off = tl.load(group_offsets + group_id)
+        group_off_nxt = tl.load(group_offsets + group_id  + 1)
+        if m >=  group_off and m < group_off_nxt:
+            id = group_id
+            off_out = group_off
+            offnxt_out = group_off_nxt
+    return id, off_out, offnxt_out
+
+@triton.jit
+def grouped_launch(pid,
+                m, n,
+                block_m: tl.constexpr, block_n: tl.constexpr, group_m: tl.constexpr):
+    
+    grid_m = tl.cdiv(m, block_m)
+    grid_n = tl.cdiv(n, block_n)
+
+    width = group_m * grid_n
+    group_id = pid // width
+    group_size = tl.minimum(grid_m - group_id * group_m, group_m)
+
+    pid_m = group_id * group_m + (pid % group_size)
+    pid_n = (pid % width) // group_size
+
+    return pid_m, pid_n
+
+@triton.jit
 def trans_per_block_quant_expand_128x_kernel(
     input_ptr,
     output_ptr,
     output_scales_ptr,
-    seq_start_per_expert,
-    seq_end_per_expert,
-    seq_start_per_expert_expand,
-    seq_end_per_expert_expand,
-    stride_in_m: tl.constexpr,
-    stride_in_n: tl.constexpr,
-    stride_out_n,
-    stride_out_m: tl.constexpr,
-    stride_out_scale_n,
-    stride_out_scale_m: tl.constexpr,
+    group_pad_offs,
+    token_cumdiffs,
+    token_ends,
+    num_experts: tl.constexpr,
+    M_pad_ptr,
     M,
     N: tl.constexpr,
+    M_EXPAND,
     fmax: tl.constexpr,
     fmin: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
     """Dequant+transpose+quant kernel."""
-    pid = tl.program_id(axis=0)
-    pid_e = tl.program_id(axis=1)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE)
-    m = pid // num_pid_n
-    n = pid % num_pid_n
 
-    seq_start_expand = tl.load(seq_start_per_expert_expand + pid_e)
-    seq_start = tl.load(seq_start_per_expert + pid_e)
-    seq_end = tl.load(seq_end_per_expert + pid_e)
-    seq_len = seq_end - seq_start
+    BLOCKS = tl.num_programs(axis=0)
+    start_pid = tl.program_id(axis=0)
+    M_pad = tl.load(M_pad_ptr)
+    num_pid_m = tl.cdiv(M_pad, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_tiles = num_pid_m * num_pid_n
+    num_tiles_pad = tl.cdiv(M_EXPAND, BLOCK_M) * num_pid_n
 
-    if m * BLOCK_SIZE >= seq_len:
-        return
+    for tile_id in tl.range(start_pid+num_tiles, num_tiles_pad, BLOCKS):
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
+        offs_an = pid_n * BLOCK_M + tl.arange(0, BLOCK_N)
+        offs_bm = offs_an
+        offs_bn = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        output_offset = (
+            output_ptr
+            + offs_bn[None, :]
+            + offs_bm[:, None] * M_EXPAND
+        )
+        output_scale_offset = (
+            output_scales_ptr
+            + pid_n * (M_EXPAND // 128) + pid_m
+        )
 
-    offs_m = m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    offs_n = n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        out = tl.zeros((BLOCK_M, BLOCK_M), dtype = output_ptr.dtype.element_ty)
+        tl.store(output_offset, out)
+        tl.store(output_scale_offset, 0)
 
-    mask_m = offs_m < seq_len
-    mask_n = offs_n < N
 
-    input_offset = (
-        input_ptr
-        + seq_start * stride_in_m
-        + offs_m[:, None] * stride_in_m
-        + offs_n[None, :] * stride_in_n
-    )
-    output_offset = (
-        output_ptr
-        + offs_n[None, :] * stride_out_n
-        + offs_m[:, None] * stride_out_m
-        + seq_start_expand * stride_out_m
-    )
+    for tile_id in tl.range(start_pid, num_tiles, BLOCKS):
+        pid_m = tile_id // num_pid_n
+        pid_n = tile_id % num_pid_n
 
-    output_scale_offset = (
-        output_scales_ptr
-        + (seq_start_expand // BLOCK_SIZE) * stride_out_scale_m
-        + m * stride_out_scale_m
-        + n * stride_out_scale_n
-    )
+        group, _, _ = get_group_id(pid_m * BLOCK_M, group_pad_offs, 0, num_experts)
+        token_cumdiff = tl.load(token_cumdiffs + group)
+        token_end = tl.load(token_ends + group)
 
-    input_block = tl.load(
-        input_offset, mask=mask_m[:, None] & mask_n[None, :], other=0.0
-    )
-    output_block_scale = tl.max(tl.max(tl.abs(input_block), 0), 0) / fmax
-    output_block_scale = tl.clamp(output_block_scale, 1e-12, 3e38)
-    input_block = input_block / output_block_scale
-    input_block = tl.clamp(input_block, fmin, fmax).to(output_ptr.dtype.element_ty)
-    tl.store(output_offset, input_block, mask=mask_n[None, :])
-    tl.store(output_scale_offset, output_block_scale)
+        offs_am = (pid_m * BLOCK_M - token_cumdiff + tl.arange(0, BLOCK_M))
+        offs_an = pid_n * BLOCK_M + tl.arange(0, BLOCK_N)
+        offs_bm = offs_an
+        offs_bn = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+
+        input_offset = (
+            input_ptr
+            + offs_am[:, None] * N
+            + offs_an[None, :] * 1
+        )
+        output_offset = (
+            output_ptr
+            + offs_bn[None, :]
+            + offs_bm[:, None] * M_EXPAND
+        )
+        output_scale_offset = (
+            output_scales_ptr
+            + pid_n * (M_EXPAND // 128) + pid_m
+        )
+
+        mask_input = (offs_am[:, None] < token_end) & (offs_an < N)
+        input_block = tl.load(
+            input_offset, mask=mask_input, other=0.0
+        )
+
+        output_block_scale = tl.max(tl.max(tl.abs(input_block), 0), 0) / fmax
+        output_block_scale = tl.clamp(output_block_scale, 1e-12, 3e38)
+        input_block = input_block / output_block_scale
+        input_block = tl.clamp(input_block, fmin, fmax).trans(1,0).to(output_ptr.dtype.element_ty)
+
+        mask_out = (offs_bm[None, :] < N)
+        tl.store(output_offset, input_block, mask = mask_out)
+        tl.store(output_scale_offset, output_block_scale)
 
 
 @triton_op("myfp8::trans_per_block_quant_expand_128x", mutates_args={})
 def trans_per_block_quant_expand_128x(
     input_tensor: torch.Tensor,
-    seq_len_per_expert: torch.Tensor,
+    size_per_group: torch.Tensor,
     group_size: int = 128,
     dtype: torch.dtype = torch.float8_e4m3fn,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -97,7 +147,7 @@ def trans_per_block_quant_expand_128x(
             per-tile quantized along N dim.
         input_scales (Tensor): The input scale. Shape [M, group_num_n].
             group_num_n=N//group_size.
-        seq_len_per_expert (Tensor): The seq length of each expert. The sum of it
+        size_per_group (Tensor): The seq length of each expert. The sum of it
             should be equal to M.
         group_size (int): The group size of the quantization. Default to 128.
 
@@ -107,54 +157,59 @@ def trans_per_block_quant_expand_128x(
         output_scales (Tensor): The output scales. Shape [N, group_num_m].
             group_num_m=(M_EXPAND+group_size-1)//group_size.
     """
-    M, N = input_tensor.shape
+    M, N = input_tensor.shape # (302873, 7168)
     assert N % group_size == 0
     finfo = torch.finfo(dtype)
     fmin = finfo.min
     fmax = finfo.max
 
-    num_experts = seq_len_per_expert.shape[0]
-    seq_len_per_expert_expand = triton.cdiv(seq_len_per_expert, 128) * 128
-    seq_end_per_expert_expand = seq_len_per_expert_expand.cumsum(0)
-    seq_start_per_expert_expand = seq_end_per_expert_expand - seq_len_per_expert_expand
-    seq_end_per_expert = seq_len_per_expert.cumsum(0)
-    seq_start_per_expert = seq_end_per_expert - seq_len_per_expert
-    M_EXPAND = M + 128 * num_experts - M % 128
+    group_pad_off = torch.zeros(size_per_group.shape[0] + 1, device = "cuda", dtype = torch.int32)
+    
+    BLOCK_M = group_size
+    size_per_group_padding = triton.cdiv(size_per_group, BLOCK_M) * BLOCK_M
+    group_pad_off[1:] = size_per_group_padding.cumsum(0)
 
+    num_experts = size_per_group.shape[0]
+    M_EXPAND = M + group_size * num_experts - M % group_size
     output_tensor = input_tensor.new_empty((N, M_EXPAND), dtype=dtype)
     output_scales = input_tensor.new_empty(
         (N // group_size, triton.cdiv(M_EXPAND, group_size)), dtype=torch.float32
     )
 
-    grid = lambda meta: (
-        triton.cdiv(M, meta["BLOCK_SIZE"]) * triton.cdiv(N, meta["BLOCK_SIZE"]),
-        num_experts,
-    )
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count - 24
+    grid = (NUM_SMS, )
+
+    M_pad = size_per_group_padding.sum()
+
+    token_diff = size_per_group_padding - size_per_group
+    token_cumdiff = token_diff.cumsum(0)
+    token_pad_end = size_per_group_padding.cumsum(0) - token_cumdiff
+    token_end = size_per_group.cumsum(0) 
+
+    token_cumdiff = token_diff.cumsum(0) - token_diff
 
     wrap_triton(trans_per_block_quant_expand_128x_kernel)[grid](
         input_tensor,
         output_tensor,
         output_scales,
-        seq_start_per_expert,
-        seq_end_per_expert,
-        seq_start_per_expert_expand,
-        seq_end_per_expert_expand,
-        input_tensor.stride(0),
-        input_tensor.stride(1),
-        output_tensor.stride(0),
-        output_tensor.stride(1),
-        output_scales.stride(0),
-        output_scales.stride(1),
+        group_pad_off,
+        token_cumdiff,
+        token_end,
+        num_experts,
+        M_pad,
         M,
         N,
+        M_EXPAND,
         fmax=fmax,
         fmin=fmin,
-        BLOCK_SIZE=group_size,
+        BLOCK_M=group_size,
+        BLOCK_N=group_size,
     )
 
-    return output_tensor, output_scales, seq_len_per_expert_expand
+    return output_tensor, output_scales, size_per_group_padding
 
 
+# @torch.compile(fullgraph=True)
 def per_block_trans_quant_expand_per_expert(
     x, eps=1e-12, block_size=128, quant_dtype=torch.float8_e4m3fn
 ):
@@ -171,7 +226,9 @@ def per_block_trans_quant_expand_per_expert(
         .reshape(-1, block_size * block_size)
     )
     amax = x_expand.abs().amax(-1, True)
-    scale = amax.float() / torch.finfo(quant_dtype).max
+    amax = amax.float()
+    scale = torch.clamp(amax, min=eps) / torch.finfo(quant_dtype).max
+    # scale = amax.float() / torch.finfo(quant_dtype).max
     x_fp8 = to_fp8_saturated(x_expand / scale, quant_dtype)
     x_fp8 = (
         x_fp8.reshape(
@@ -185,14 +242,20 @@ def per_block_trans_quant_expand_per_expert(
     return x_fp8, scale
 
 
-def per_block_trans_quant_expand_torch(x, tokens_per_expert):
+@torch.library.custom_op("moe::per_block_trans_quant_expand_torch", mutates_args=())
+def per_block_trans_quant_expand_torch(
+    x: torch.Tensor, 
+    tokens_per_expert: torch.Tensor,
+    group_size: int = 128,
+    dtype: torch.dtype = torch.float8_e4m3fn,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     M = x.shape[0]
     ne = tokens_per_expert.shape[0]
 
     x_list = torch.split(x, tokens_per_expert.tolist(), dim=0)
     x_trans_quant_list, x_trans_quant_scale_list = [], []
     for x in x_list:
-        x_fp8, scale = per_block_trans_quant_expand_per_expert(x)
+        x_fp8, scale = per_block_trans_quant_expand_per_expert(x, block_size=group_size, quant_dtype=dtype)
         x_trans_quant_list.append(x_fp8)
         x_trans_quant_scale_list.append(scale)
     x_trans_quant = torch.cat(x_trans_quant_list, dim=-1)
@@ -207,6 +270,24 @@ def per_block_trans_quant_expand_torch(x, tokens_per_expert):
     x_trans_quant_scale = torch.cat([x_trans_quant_scale, pad], dim=1)
 
     return x_trans_quant, x_trans_quant_scale, triton.cdiv(tokens_per_expert, 128) * 128
+
+
+@per_block_trans_quant_expand_torch.register_fake
+def _(
+    x: torch.Tensor, 
+    tokens_per_expert: torch.Tensor,
+    group_size: int = 128,
+    dtype: torch.dtype = torch.float8_e4m3fn,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    M, N = x.shape
+    num_experts = tokens_per_expert.shape[0]
+    M_EXPAND = M + 128 * num_experts - M % 128
+    output_tensor = x.new_empty((N, M_EXPAND), dtype=dtype)
+    output_scales = x.new_empty(
+        (N // group_size, triton.cdiv(M_EXPAND, group_size)), dtype=torch.float32
+    )
+    tokens_per_expert_expand = torch.empty_like(tokens_per_expert)
+    return output_tensor, output_scales, tokens_per_expert_expand
 
 
 if __name__ == "__main__":
