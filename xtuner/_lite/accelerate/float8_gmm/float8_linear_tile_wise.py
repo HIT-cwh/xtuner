@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 
+from typing import Any, Dict, Tuple
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -22,6 +23,10 @@ from xtuner._lite.accelerate.float8_gmm.triton_kernels import (
     gmm_dw_fp8_act_per_channel_w_per_expert,
     gmm_fp8_act_per_channel_w_per_expert,
     trans_quant_expand_128x,
+    per_block_quant_gemm,
+    per_tile_quant_gemm,
+    trans_per_block_quant_gemm,
+    trans_per_tile_quant_gemm,
 )
 from xtuner._lite.accelerate.float8_gmm.fsdp_utils import (
     WeightWithDynamicFloat8CastTensor,
@@ -141,6 +146,39 @@ class weight_to_per_block_float8_dynamic(torch.autograd.Function):
         return g, None, None, None
 
 
+@torch.library.custom_op("moe::save", mutates_args=('grad_out_trans_fp8', 'dw', 'grad_out_trans_scale', 'x_trans_fp8', 'x_trans_scale'))
+def save(
+        dw: torch.Tensor, 
+        grad_output_hp: torch.Tensor,
+        grad_out_trans_fp8: torch.Tensor,
+        grad_out_trans_scale: torch.Tensor,
+        x_trans_fp8: torch.Tensor,
+        x_trans_scale: torch.Tensor,
+    ) -> None:
+    # print(grad_output_hp)
+    if torch.isnan(dw).any():
+        torch.save(grad_output_hp, f'/cpfs01/shared/llm_razor/caoweihan/projects/xtuner_xpuyu_new/xpuyu_temp/pths/rank{dist.get_rank()}_grad_output_hp.pth')
+        torch.save(grad_out_trans_fp8, f'/cpfs01/shared/llm_razor/caoweihan/projects/xtuner_xpuyu_new/xpuyu_temp/pths/rank{dist.get_rank()}_grad_out_trans_fp8.pth')
+        torch.save(grad_out_trans_scale, f'/cpfs01/shared/llm_razor/caoweihan/projects/xtuner_xpuyu_new/xpuyu_temp/pths/rank{dist.get_rank()}_grad_out_trans_scale.pth')
+        torch.save(x_trans_fp8, f'/cpfs01/shared/llm_razor/caoweihan/projects/xtuner_xpuyu_new/xpuyu_temp/pths/rank{dist.get_rank()}_x_trans_fp8.pth')
+        torch.save(x_trans_scale.contiguous(), f'/cpfs01/shared/llm_razor/caoweihan/projects/xtuner_xpuyu_new/xpuyu_temp/pths/rank{dist.get_rank()}_x_trans_scale.pth')
+        torch.save(dw, f'/cpfs01/shared/llm_razor/caoweihan/projects/xtuner_xpuyu_new/xpuyu_temp/pths/rank{dist.get_rank()}_dw.pth')
+    
+    assert not torch.isnan(dw).any()
+    
+
+@save.register_fake
+def _(
+        dw: torch.Tensor, 
+        grad_output_hp: torch.Tensor,
+        grad_out_trans_fp8: torch.Tensor,
+        grad_out_trans_scale: torch.Tensor,
+        x_trans_fp8: torch.Tensor,
+        x_trans_scale: torch.Tensor,
+) -> None:
+    return 
+
+
 class fp8_matmul_weight_per_block_act_per_tile(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w_fp8):
@@ -149,8 +187,8 @@ class fp8_matmul_weight_per_block_act_per_tile(torch.autograd.Function):
         x = x.squeeze(0)
         seq, din = x.shape
 
-        x_fp8, x_scale = per_tile_quant(x)
-        x_trans_fp8, x_trans_scale = per_block_trans_quant(x)
+        x_fp8, x_scale = per_tile_quant_gemm(x)
+        x_trans_fp8, x_trans_scale = trans_per_block_quant_gemm(x)
 
         dout = w_fp8._data.shape[0]
         out = x.new_empty((seq, dout))
@@ -189,7 +227,7 @@ class fp8_matmul_weight_per_block_act_per_tile(torch.autograd.Function):
             w_fp8_data = w_fp8._data.transpose(0, 1).contiguous()
         w_fp8_scale = w_fp8._scale.transpose(0, 1).contiguous()
 
-        grad_out_pad_fp8, grad_out_pad_scale = per_tile_quant(grad_output_hp_pad)
+        grad_out_pad_fp8, grad_out_pad_scale = per_tile_quant_gemm(grad_output_hp_pad)
         dx = grad_output_hp_pad.new_empty((seq, din))
         gemm_fp8_fp8_bf16_nt(
             grad_out_pad_fp8, grad_out_pad_scale,
@@ -198,7 +236,7 @@ class fp8_matmul_weight_per_block_act_per_tile(torch.autograd.Function):
         )
         dx = dx.unsqueeze(0)
 
-        grad_out_trans_fp8, grad_out_trans_scale = per_tile_trans_quant(grad_output_hp)
+        grad_out_trans_fp8, grad_out_trans_scale = trans_per_tile_quant_gemm(grad_output_hp)
         dw = grad_output_hp.new_empty((dout, din))
         gemm_fp8_fp8_bf16_nt(
             grad_out_trans_fp8, grad_out_trans_scale,
