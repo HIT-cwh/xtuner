@@ -595,7 +595,6 @@ class WeightWithDynamicTilewiseFloat8CastTensor(torch.Tensor):
         )
 
     def fsdp_pre_all_gather(self, mesh): 
-        # dist.breakpoint()
         tensor = self._tensor.view(-1, self._ori_shape[-1])
         if self._precomputed_scale is not None:
             raise NotImplementedError
@@ -627,16 +626,13 @@ class WeightWithDynamicTilewiseFloat8CastTensor(torch.Tensor):
         out: Optional[torch.Tensor] = None,
     ):
         data, scale = all_gather_outputs
-        tensor = self._tensor.view(-1, self._ori_shape[-1])
-        if tensor.shape[0] < 128:
+        reduce_group = get_tilewise_fp8_reduce_group(self._ori_shape)
+        if reduce_group is not None:
             # 算 amax 的时候已经做了 reduce max，all gather 得到了不同 rank 上重复的 scales
             # 需要 slice 掉
-            reduce_group = get_tilewise_fp8_reduce_group(self._ori_shape)
-            assert reduce_group is not None
             reduce_world_size = dist.get_world_size(reduce_group)
-            assert 128 // tensor.shape[0] == reduce_world_size, \
-                f'WeightWithDynamicTilewiseFloat8CastTensor.fsdp_post_all_gather, ' \
-                f'tensor.shape[0] = {tensor.shape[0]}, reduce_world_size = {reduce_world_size}'
+            assert data.numel() // (128**2) == scale.numel() // reduce_world_size, \
+                f'ori_shape = {self._ori_shape}, data.numel() = {data.numel()}, scale.numel() = {scale.numel()}, reduce_world_size = {reduce_world_size}'
             scale = scale.view(-1, reduce_world_size, self._ori_shape[1] // 128)
             scale = scale[:, 0]
 
@@ -645,7 +641,6 @@ class WeightWithDynamicTilewiseFloat8CastTensor(torch.Tensor):
         scale_dim0 = math.ceil(self._ori_shape[0] / 128)
         scale = scale[:scale_dim0]
         scale = scale.contiguous()
-        # dist.breakpoint()
         
         if out is not None:
             from torch.distributed._tensor import DTensor
