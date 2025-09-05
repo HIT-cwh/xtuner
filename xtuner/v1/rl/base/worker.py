@@ -23,7 +23,7 @@ from xtuner.v1.float8.fsdp_utils import WeightWithDynamicTilewiseFloat8CastTenso
 from xtuner.v1.model.base import ModelItem
 from xtuner.v1.ray.accelerator import SingleAcceleratorWorker
 from xtuner.v1.ray.config import RolloutConfig
-from xtuner.v1.rl.utils import gather_logprobs
+from xtuner.v1.rl.utils import gather_logprobs_nograd
 from xtuner.v1.utils import ParallelConfigException, get_device, get_logger, get_torch_device_module, log_format
 
 from ..loss_fn import kl_penalty
@@ -231,7 +231,7 @@ class TrainingWorker(SingleAcceleratorWorker):
     ) -> list[RLLossContextInputItem]:
         for i, (seq_ctx, loss_ctx_input) in enumerate(zip(seq_ctx_list, loss_ctx_input_list)):
             output = self._engine.forward_only(seq_ctx=seq_ctx, is_first=(i == 0))
-            loss_ctx_input.old_logprobs = gather_logprobs(output["logits"], loss_ctx_input.shifted_labels)
+            loss_ctx_input.old_logprobs = gather_logprobs_nograd(output["logits"], loss_ctx_input.shifted_labels)
         return loss_ctx_input_list
 
     def compute_ref_logprobs(
@@ -244,7 +244,7 @@ class TrainingWorker(SingleAcceleratorWorker):
         for seq_ctx, loss_ctx_input in zip(seq_ctx_list, loss_ctx_input_list):
             with torch.no_grad():
                 ref_output = self._ref_model(seq_ctx=seq_ctx, loss_ctx=None)
-            ref_logprobs = gather_logprobs(ref_output["logits"], loss_ctx_input.shifted_labels)
+            ref_logprobs = gather_logprobs_nograd(ref_output["logits"], loss_ctx_input.shifted_labels)
             loss_ctx_input.ref_logprobs = ref_logprobs
         self._ref_model.to_device("cpu")
         return loss_ctx_input_list

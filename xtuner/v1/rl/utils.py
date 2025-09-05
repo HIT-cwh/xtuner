@@ -1,5 +1,6 @@
 from typing import Any
 
+import torch
 import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 
@@ -18,6 +19,13 @@ def sp_split(
 
 
 def gather_logprobs(logits, shifted_labels):
+    logprobs = F.log_softmax(logits, dim=-1)
+    logprobs = logprobs.gather(dim=-1, index=shifted_labels.clip(min=0).unsqueeze(-1)).squeeze(-1)
+    return logprobs
+
+
+@torch.compile(fullgraph=True)
+def gather_logprobs_nograd(logits, shifted_labels):
     logprobs = F.log_softmax(logits, dim=-1)
     logprobs = logprobs.gather(dim=-1, index=shifted_labels.clip(min=0).unsqueeze(-1)).squeeze(-1)
     return logprobs
