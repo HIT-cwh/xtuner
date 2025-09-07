@@ -27,7 +27,7 @@ from xtuner.v1.config import (
     FSDPConfig,
     LRConfig,
 )
-from xtuner.v1.config.float8 import Float8Config, ScalingGranularity
+from xtuner.v1.float8.config import Float8Config, ScalingGranularity
 from xtuner.v1.ray.judger.controller import JudgerConfig
 from xtuner.v1.rl.base import WorkerConfig
 from xtuner.v1.rl.grpo import GRPOLossConfig
