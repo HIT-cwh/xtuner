@@ -3,6 +3,7 @@ import os
 import time
 from pathlib import Path
 from typing import Dict, List, TypeAlias, TypedDict, cast
+import math
 
 import requests
 import torch
@@ -22,6 +23,7 @@ from xtuner.v1.ray.accelerator import SingleAcceleratorWorker
 from xtuner.v1.ray.config import RolloutConfig
 from xtuner.v1.rl.utils import gather_logprobs
 from xtuner.v1.utils import ParallelConfigException, get_device, get_logger, get_torch_device_module, log_format
+from xtuner.v1.data_proto.sequence_context import SequenceContext
 
 from ..loss_fn import kl_penalty
 from .loss import BaseRLLossConfig, RLLossContextInputItem
@@ -238,8 +240,108 @@ class TrainingWorker(SingleAcceleratorWorker):
             loss_ctx_input.ref_logprobs = ref_logprobs
         self._ref_model.to_device("cpu")
         return loss_ctx_input_list
-
+    
     def fit(self, data_batches: list[list[WorkerInputItem]], rollout_idx: int):
+        rank = dist.get_rank()
+        for step_idx in range(16):
+            pths = []
+            pattern = f'rank{rank}_rollout_step1_step{step_idx}_'
+            for root, dirs, files in os.walk('/cpfs01/shared/llm_razor/caoweihan/projects/verl/trajectory3'):
+                for file in files:
+                    if file.endswith('.pth'):
+                        absolute_path = os.path.join(root, file)
+                        if pattern in absolute_path:
+                            pths.append(absolute_path)
+            grad_acc = len(pths)
+            seq_ctx_list = []
+            loss_ctx_input_list = []
+            old_logprob_list = []
+            for acc in range(grad_acc):
+                data = torch.load(f'/cpfs01/shared/llm_razor/caoweihan/projects/verl/trajectory3/rank{rank}_rollout_step1_step{step_idx}_acc{acc}_model_inputs.pth', map_location=DEVICE)
+                input_ids = data['input_ids']
+                n = input_ids.size(0)
+                n_per_rank = math.ceil(n / 4)
+                sp_rank = rank % 4
+                input_ids = input_ids[sp_rank * n_per_rank : (sp_rank + 1) * n_per_rank]
+                attention_mask = data['attention_mask'][sp_rank * n_per_rank : (sp_rank + 1) * n_per_rank]
+                input_ids_flatten = input_ids.view(-1)[attention_mask.view(-1) != 0]
+                input_ids_list = torch.split(input_ids_flatten, attention_mask.sum(-1).cpu().tolist())
+                seq_ctx = SequenceContext.from_input_ids([ids.view(1, -1) for ids in input_ids_list], device="cuda")
+                seq_ctx_list.append(seq_ctx)
+
+                response_mask = data['response_mask'][sp_rank * n_per_rank : (sp_rank + 1) * n_per_rank]
+                response_lens = response_mask.sum(-1).tolist()
+                prompt_ids_list = [input_ids_list[i][:-response_lens[i]] for i in range(len(response_lens))]
+                response_ids_list = [input_ids_list[i][-response_lens[i]:] for i in range(len(response_lens))]
+                labels_list = []
+                for i in range(len(response_lens)):
+                    labels = [-100] * (len(prompt_ids_list[i]) - 1) + response_ids_list[i].tolist() + [-100]
+                    labels_list.extend(labels)
+                shifted_labels = torch.tensor(labels_list, device=DEVICE)
+                advantages = data['advantages'][sp_rank * n_per_rank : (sp_rank + 1) * n_per_rank].view(-1)[response_mask.view(-1) != 0]
+                advantages_list = list(torch.split(advantages, response_mask.sum(-1).cpu().tolist()))
+                for i in range(len(advantages_list)):
+                    advantages_list[i] = torch.cat([torch.full((prompt_ids_list[i].size(0),), advantages_list[i][0].item(), device=DEVICE, dtype=advantages_list[i].dtype), advantages_list[i]])
+                advantages = torch.cat(advantages_list, dim=0)
+
+                # response_mask_copy = response_mask.clone()
+                # for i, idx in enumerate(response_mask.sum(-1).tolist()):
+                #     response_mask_copy[i, idx] = 1
+                old_log_probs = data['old_log_probs'][sp_rank * n_per_rank : (sp_rank + 1) * n_per_rank]
+                old_logprob_list.append(old_log_probs)
+                # old_log_probs_list = list(torch.split(old_log_probs, response_mask_copy.sum(-1).cpu().tolist()))
+                # for i in range(len(old_log_probs_list)):
+                #     old_log_probs_list[i] = torch.cat([torch.full((prompt_ids_list[i].size(0) - 1,), 0.0, device=DEVICE, dtype=old_log_probs_list[i].dtype), old_log_probs_list[i]])
+                # old_log_probs = torch.cat(old_log_probs_list, dim=0)
+
+                loss_ctx_input_list.append(
+                    RLLossContextInputItem(
+                        shifted_labels=shifted_labels.view(1, -1),
+                        advantages=advantages.view(1, -1),
+                        # old_logprobs=old_log_probs,
+                    )
+                )
+            
+            loss_ctx_input_list = self.compute_actor_logprobs(seq_ctx_list, loss_ctx_input_list)
+            loss_cfg = self.config.loss_cfg
+            LossContext = loss_cfg.loss_ctx_cls
+            batches_loss_kwargs = LossContext.build_batches_loss_kwargs(loss_ctx_input_list, loss_cfg)
+            breakpoint()
+            engine_input = []
+            assert len(seq_ctx_list) == len(batches_loss_kwargs)
+            for seq_ctx, loss_kwargs in zip(seq_ctx_list, batches_loss_kwargs):
+                loss_ctx = LossContext(
+                    loss_cfg=loss_cfg,
+                    loss_kwargs=loss_kwargs,
+                )
+                engine_input.append(
+                    ModelItem(
+                        seq_ctx=seq_ctx,
+                        loss_ctx=loss_ctx,
+                    )
+                )
+            
+            loss_log, other_log = self._engine.train_step(
+                data_batches=engine_input,
+            )
+            grad_norm = self._engine.clip_grad_norm()
+            self._engine.step_optimizer(grad_norm)
+            log_info = dict()
+            log_info.update(loss_log)
+            log_info.update(other_log)
+            log_info["grad_norm"] = grad_norm.item()
+            log_str = ", ".join(
+                f"{key}={value:.4f}" if isinstance(value, float) else f"{key}={value}"
+                for key, value in log_info.items()
+            )
+            log_str = f"Rollout {rollout_idx} Step {step_idx}: " + log_str
+            logger.info(log_str)
+
+        breakpoint()
+
+    def fit1(self, data_batches: list[list[WorkerInputItem]], rollout_idx: int):
+        rank = dist.get_rank()
+
         # num_batches = len(data_batches)
         iters_per_step = [len(data) for data in data_batches]
         accum_iters = [0]

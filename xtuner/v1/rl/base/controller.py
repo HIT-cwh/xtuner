@@ -164,25 +164,26 @@ class TrainingController:
         return packed_data_batches
 
     def fit(self, data_batches: list[list[ColateItem]], pack_max_length: int, optimizer_steps: int, rollout_idx: int):
-        optimizer_steps = min(optimizer_steps, len(data_batches))
-        n_groups_per_step = math.ceil(len(data_batches) / optimizer_steps)
-        packed_data_batches_all_steps: list[list[ColateItem]] = []
-        for i in range(optimizer_steps):
-            packed_data_batches_all_steps.append(
-                self._pack_and_pad(
-                    data_batches[i * n_groups_per_step : (i + 1) * n_groups_per_step],
-                    pack_max_length,
-                )
-            )
+        # optimizer_steps = min(optimizer_steps, len(data_batches))
+        # n_groups_per_step = math.ceil(len(data_batches) / optimizer_steps)
+        # packed_data_batches_all_steps: list[list[ColateItem]] = []
+        # for i in range(optimizer_steps):
+        #     packed_data_batches_all_steps.append(
+        #         self._pack_and_pad(
+        #             data_batches[i * n_groups_per_step : (i + 1) * n_groups_per_step],
+        #             pack_max_length,
+        #         )
+        #     )
         
         handles = []
         data_replicate_size = ray.get(self.workers[0].get_data_replicate_size.remote())  # type: ignore[attr-defined]
         dp_size = len(self.workers) // data_replicate_size
         for worker_idx, worker in enumerate(self.workers):
-            packed_data_batches_all_steps_cur = [data[(worker_idx // data_replicate_size) :: dp_size] for data in packed_data_batches_all_steps]
+            # packed_data_batches_all_steps_cur = [data[(worker_idx // data_replicate_size) :: dp_size] for data in packed_data_batches_all_steps]
             handles.append(
                 worker.fit.remote(  # type: ignore[attr-defined]
-                    data_batches=packed_data_batches_all_steps_cur,
+                    # data_batches=packed_data_batches_all_steps_cur,
+                    data_batches=[],
                     rollout_idx=rollout_idx,
                 )
             )

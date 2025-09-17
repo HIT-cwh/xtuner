@@ -209,35 +209,35 @@ class RLTrainer:
         # inference engines know how much memory they can utilize.
         self._train_controller = self._build_train_controller(train_worker_cfg)
 
-        self._rollout_env_controller, self._rollout_dataflow = self._build_rollout_dataflow(
-            dataflow_cfg=dataflow_config,
-            rollout_cfg=rollout_config,
-            judger_cfg=judger_config,
-            replay_buffer_config=replay_buffer_config,
-        )
-        if self._enable_evaluate and evaluator_config:
-            self._evaluator = Evaluator.remote(evaluator_config, self._rollout_env_controller)  # type: ignore[attr-defined]
-            self._evaluator_sample_params = SampleParams(
-                top_p=1.0,
-                temperature=0.0,
-                do_sample=False,
-                max_tokens=dataflow_config.sample_params.max_tokens,
-                top_k=1,
-            )
-            self._eval_step = evaluator_config.evaluate_step
-        else:
-            self._evaluator = None
-            self._evaluator_sample_params = SampleParams()
-            self._eval_step = 0
+        # self._rollout_env_controller, self._rollout_dataflow = self._build_rollout_dataflow(
+        #     dataflow_cfg=dataflow_config,
+        #     rollout_cfg=rollout_config,
+        #     judger_cfg=judger_config,
+        #     replay_buffer_config=replay_buffer_config,
+        # )
+        # if self._enable_evaluate and evaluator_config:
+        #     self._evaluator = Evaluator.remote(evaluator_config, self._rollout_env_controller)  # type: ignore[attr-defined]
+        #     self._evaluator_sample_params = SampleParams(
+        #         top_p=1.0,
+        #         temperature=0.0,
+        #         do_sample=False,
+        #         max_tokens=dataflow_config.sample_params.max_tokens,
+        #         top_k=1,
+        #     )
+        #     self._eval_step = evaluator_config.evaluate_step
+        # else:
+        #     self._evaluator = None
+        #     self._evaluator_sample_params = SampleParams()
+        #     self._eval_step = 0
 
-        self._global_batch_size = dataflow_config.global_batch_size
-        self._rollout_steps = (
-            ray.get(self._rollout_dataflow.get_train_dataset_length.remote())  # type: ignore[attr-defined]
-            // dataflow_config.global_batch_size
-            * total_epochs
-        )
-        bind_train_rollout(train_controller=self._train_controller, env_controller=self._rollout_env_controller)
-        ray.get(self._train_controller.offload.remote(target="all"))
+        # self._global_batch_size = dataflow_config.global_batch_size
+        # self._rollout_steps = (
+        #     ray.get(self._rollout_dataflow.get_train_dataset_length.remote())  # type: ignore[attr-defined]
+        #     // dataflow_config.global_batch_size
+        #     * total_epochs
+        # )
+        # bind_train_rollout(train_controller=self._train_controller, env_controller=self._rollout_env_controller)
+        # ray.get(self._train_controller.offload.remote(target="all"))
 
         self._train_worker_cfg = train_worker_cfg
 
@@ -279,48 +279,50 @@ class RLTrainer:
         evaluation.
         """
         self.logger.info("start training")
-        if self._enable_evaluate and self._evaluator:
-            scores, eval_data_groups = ray.get(
-                self._evaluator.run.remote(return_samples=True, sample_params=self._evaluator_sample_params)
-            )
-            trajectory_save_path = self.exp_dir / "initial_trajectory.jsonl"
-            self._save_trajectories(eval_data_groups, trajectory_save_path)
-            self.logger.info(f"Initial rollout evaluate scores {scores} and start training")
-        for rollout_idx in range(1, self._rollout_steps + 1):
-            data_groups = ray.get(self._rollout_dataflow.run.remote())
+        # if self._enable_evaluate and self._evaluator:
+        #     scores, eval_data_groups = ray.get(
+        #         self._evaluator.run.remote(return_samples=True, sample_params=self._evaluator_sample_params)
+        #     )
+        #     trajectory_save_path = self.exp_dir / "initial_trajectory.jsonl"
+        #     self._save_trajectories(eval_data_groups, trajectory_save_path)
+        #     self.logger.info(f"Initial rollout evaluate scores {scores} and start training")
+        # for rollout_idx in range(1, self._rollout_steps + 1):
+        for rollout_idx in range(1, 106):
+            # data_groups = ray.get(self._rollout_dataflow.run.remote())
             time.sleep(3)
-            ray.get(self._rollout_env_controller.offload.remote())
-            trajectory_save_path = self.exp_dir / f"rollout_idx_{rollout_idx}_trajectory.jsonl"
-            self._save_trajectories(data_groups, trajectory_save_path)
-            self.logger.info(f"rollout_idx {rollout_idx} finished, saved trajectories to {trajectory_save_path}")
-            ray.get(self._train_controller.onload.remote(target="all"))
-            self.logger.info("Training controller loaded")
-            data_batches, data_info = self._prepare_train_data(data_groups, self._train_worker_cfg.pack_max_length)
-            self.logger.info(f"Prepared {len(data_batches)} prompts and {len(data_batches) * len(data_batches[0])} responses training data batches")
-            self.logger.info(f"DataInfo {data_info}")
+            # ray.get(self._rollout_env_controller.offload.remote())
+            # trajectory_save_path = self.exp_dir / f"rollout_idx_{rollout_idx}_trajectory.jsonl"
+            # self._save_trajectories(data_groups, trajectory_save_path)
+            # self.logger.info(f"rollout_idx {rollout_idx} finished, saved trajectories to {trajectory_save_path}")
+            # ray.get(self._train_controller.onload.remote(target="all"))
+            # self.logger.info("Training controller loaded")
+            # data_batches, data_info = self._prepare_train_data(data_groups, self._train_worker_cfg.pack_max_length)
+            # self.logger.info(f"Prepared {len(data_batches)} prompts and {len(data_batches) * len(data_batches[0])} responses training data batches")
+            # self.logger.info(f"DataInfo {data_info}")
 
             # save_dir = f"/cpfs01/shared/llm_razor/lishuaibin/xtuner_v1_outputs/lmdeploy1/train_data/global_step{rollout_idx}.pt"
             # torch.save(data_batches, save_dir)
 
             ray.get(
                 self._train_controller.fit.remote(
-                    data_batches, 
+                    # data_batches, 
+                    [],
                     pack_max_length=self._train_worker_cfg.pack_max_length, 
                     optimizer_steps=self._train_worker_cfg.optimizer_steps,
                     rollout_idx=rollout_idx
                 )
             )
-            ray.get(self._train_controller.offload.remote(target="optimizer"))
-            self._maybe_save_hf()
-            ray.get(self._rollout_env_controller.onload_weights.remote())
-            ray.get(self._train_controller.update_weights.remote())
-            self.logger.info("update weights done!!!")
-            ray.get(self._train_controller.offload.remote(target="model"))
-            ray.get(self._rollout_env_controller.onload_kvcache.remote())
+            # ray.get(self._train_controller.offload.remote(target="optimizer"))
+            # self._maybe_save_hf()
+            # ray.get(self._rollout_env_controller.onload_weights.remote())
+            # ray.get(self._train_controller.update_weights.remote())
+            # self.logger.info("update weights done!!!")
+            # ray.get(self._train_controller.offload.remote(target="model"))
+            # ray.get(self._rollout_env_controller.onload_kvcache.remote())
             # evaluate
-            if self._enable_evaluate and self._evaluator and rollout_idx % self._eval_step == 0:
-                scores = ray.get(self._evaluator.run.remote(sample_params=self._evaluator_sample_params))
-                self.logger.info(f"evaluate idx {rollout_idx} scores {scores}")
+            # if self._enable_evaluate and self._evaluator and rollout_idx % self._eval_step == 0:
+            #     scores = ray.get(self._evaluator.run.remote(sample_params=self._evaluator_sample_params))
+            #     self.logger.info(f"evaluate idx {rollout_idx} scores {scores}")
             self._cur_epoch += 1
 
     # TODO: advantage 是在 DataFlow 里算好，还是在 train controller 里算？
