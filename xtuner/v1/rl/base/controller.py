@@ -72,6 +72,7 @@ class TrainingController:
             seq_ctx_list = [data_batches[i]["seq_ctx"] for i in indices]
             label_list = [data_batches[i]["shifted_labels"] for i in indices]
             advantage_list = [data_batches[i]["advantage"] for i in indices]
+            pad_len = 0
             if pad_len > 0:
                 # Reduce the attn calculation time by using multiple short sequence packs
                 pad_tokens = tuple(

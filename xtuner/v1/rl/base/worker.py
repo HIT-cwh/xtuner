@@ -246,7 +246,7 @@ class TrainingWorker(SingleAcceleratorWorker):
         for step_idx in range(16):
             pths = []
             pattern = f'rank{rank}_rollout_step1_step{step_idx}_'
-            for root, dirs, files in os.walk('/cpfs01/shared/llm_razor/caoweihan/projects/verl/trajectory3'):
+            for root, dirs, files in os.walk('/mnt/shared-storage-user/caoweihan/projects/verl/trajectory3'):
                 for file in files:
                     if file.endswith('.pth'):
                         absolute_path = os.path.join(root, file)
@@ -257,11 +257,12 @@ class TrainingWorker(SingleAcceleratorWorker):
             loss_ctx_input_list = []
             old_logprob_list = []
             for acc in range(grad_acc):
-                data = torch.load(f'/cpfs01/shared/llm_razor/caoweihan/projects/verl/trajectory3/rank{rank}_rollout_step1_step{step_idx}_acc{acc}_model_inputs.pth', map_location=DEVICE)
+                data = torch.load(f'/mnt/shared-storage-user/caoweihan/projects/verl/trajectory3/rank{rank}_rollout_step1_step{step_idx}_acc{acc}_model_inputs.pth', map_location=DEVICE)
                 input_ids = data['input_ids']
                 n = input_ids.size(0)
-                n_per_rank = math.ceil(n / 4)
-                sp_rank = rank % 4
+                sp_size = 1
+                n_per_rank = math.ceil(n / sp_size)
+                sp_rank = rank % sp_size
                 input_ids = input_ids[sp_rank * n_per_rank : (sp_rank + 1) * n_per_rank]
                 attention_mask = data['attention_mask'][sp_rank * n_per_rank : (sp_rank + 1) * n_per_rank]
                 input_ids_flatten = input_ids.view(-1)[attention_mask.view(-1) != 0]
@@ -287,26 +288,33 @@ class TrainingWorker(SingleAcceleratorWorker):
                 # response_mask_copy = response_mask.clone()
                 # for i, idx in enumerate(response_mask.sum(-1).tolist()):
                 #     response_mask_copy[i, idx] = 1
-                old_log_probs = data['old_log_probs'][sp_rank * n_per_rank : (sp_rank + 1) * n_per_rank]
-                old_logprob_list.append(old_log_probs)
-                # old_log_probs_list = list(torch.split(old_log_probs, response_mask_copy.sum(-1).cpu().tolist()))
-                # for i in range(len(old_log_probs_list)):
+                old_log_probs = data['old_log_probs'][sp_rank * n_per_rank : (sp_rank + 1) * n_per_rank].view(-1)[response_mask.view(-1) != 0]
+                # old_logprob_list.append(old_log_probs)
+                old_log_probs_list = list(torch.split(old_log_probs, response_mask.sum(-1).cpu().tolist()))
+                for i in range(len(old_log_probs_list)):
+                    old_log_probs = [0] * (prompt_ids_list[i].size(0) - 1) + old_log_probs_list[i].flatten().tolist() + [0]
+                    old_log_probs = torch.Tensor(old_log_probs).to(device='cuda', dtype=old_log_probs_list[i].dtype)
+                    old_log_probs_list[i] = old_log_probs
                 #     old_log_probs_list[i] = torch.cat([torch.full((prompt_ids_list[i].size(0) - 1,), 0.0, device=DEVICE, dtype=old_log_probs_list[i].dtype), old_log_probs_list[i]])
-                # old_log_probs = torch.cat(old_log_probs_list, dim=0)
+                old_log_probs = torch.cat(old_log_probs_list, dim=0).view(1, -1)
+                loss_scale_factor = data['response_mask'].shape[0] / 64
 
                 loss_ctx_input_list.append(
                     RLLossContextInputItem(
                         shifted_labels=shifted_labels.view(1, -1),
                         advantages=advantages.view(1, -1),
-                        # old_logprobs=old_log_probs,
+                        loss_scale_factor=loss_scale_factor,
+                        old_logprobs=old_log_probs,
                     )
                 )
             
-            loss_ctx_input_list = self.compute_actor_logprobs(seq_ctx_list, loss_ctx_input_list)
+            # loss_ctx_input_list = self.compute_actor_logprobs(seq_ctx_list, loss_ctx_input_list)
             loss_cfg = self.config.loss_cfg
             LossContext = loss_cfg.loss_ctx_cls
-            batches_loss_kwargs = LossContext.build_batches_loss_kwargs(loss_ctx_input_list, loss_cfg)
-            breakpoint()
+            batches_loss_kwargs = LossContext.build_batches_loss_kwargs(
+                loss_ctx_input_list, loss_cfg, 
+                [seq_ctx.cu_seq_lens_q for seq_ctx in seq_ctx_list]
+                )
             engine_input = []
             assert len(seq_ctx_list) == len(batches_loss_kwargs)
             for seq_ctx, loss_kwargs in zip(seq_ctx_list, batches_loss_kwargs):
@@ -321,11 +329,19 @@ class TrainingWorker(SingleAcceleratorWorker):
                     )
                 )
             
+            os.environ['stop'] = '1'
             loss_log, other_log = self._engine.train_step(
                 data_batches=engine_input,
             )
+            os.environ['stop'] = '0'
             grad_norm = self._engine.clip_grad_norm()
+            grad_norm = grad_norm * 1
+            # if rank == 0:
+            #     breakpoint()
             self._engine.step_optimizer(grad_norm)
+            
+            current_lr = self._engine.optimizer.param_groups[0]['lr']
+            logger.info(f"current_lr {current_lr} grad_norm: {grad_norm}")
             log_info = dict()
             log_info.update(loss_log)
             log_info.update(other_log)

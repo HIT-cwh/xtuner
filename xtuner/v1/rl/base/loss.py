@@ -93,6 +93,7 @@ class RLLossContextInputItem(BaseModel):
     advantages: torch.Tensor
     old_logprobs: torch.Tensor | None = None
     ref_logprobs: torch.Tensor | None = None
+    loss_scale_factor: float | None = None
 
     def sp_split(self, sp_mesh: DeviceMesh) -> Self:
         shifted_labels = sp_split(self.shifted_labels, sp_mesh=sp_mesh, split_dim=1, padding_value=-100)

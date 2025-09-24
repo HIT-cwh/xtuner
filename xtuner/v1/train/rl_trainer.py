@@ -474,8 +474,8 @@ class RLTrainer:
         return logger
 
     def _set_deterministic(self):
-        if XTUNER_DETERMINISTIC:
-            torch.use_deterministic_algorithms(True, warn_only=True)
+        # if XTUNER_DETERMINISTIC:
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
     def _set_random_seed(self, seed: int):
         set_random_seed(seed)

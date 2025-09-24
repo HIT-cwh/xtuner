@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 
 from typing import Annotated, Literal, cast
+import os
 
 import torch
 from cyclopts import Parameter
@@ -20,7 +21,8 @@ from xtuner.v1.utils import XTUNER_DETERMINISTIC, get_logger
 from ..linear.linear import build_linear
 from ..rms_norm import RMSNorm
 from .kv_cache import fill_paged_kv_cache
-
+from transformers.modeling_flash_attention_utils import _flash_attention_forward, _lazy_imports
+from transformers.utils import is_flash_attn_3_available
 
 logger = get_logger()
 
@@ -381,21 +383,40 @@ class MultiHeadAttention(nn.Module):
                 sinks = self.sinks
             kwargs["s_aux"] = sinks
         # [b, n_head, seq, head_dim]
-        attn_output: torch.Tensor = self.attn_impl_func(  # type: ignore
-            query_states,
-            key_states,
-            value_states,
-            cu_seqlens_q=seq_ctx.cu_seq_lens_q,
-            cu_seqlens_k=seq_ctx.cu_seq_lens_k,
-            max_seqlen_q=seq_ctx.max_length_q,
-            max_seqlen_k=seq_ctx.max_length_k,
-            window_size=self.window_size,
-            dropout_p=self.dropout,
-            softmax_scale=self.scaling,
-            causal=True,
-            deterministic=XTUNER_DETERMINISTIC,
-            **kwargs,
-        )
+        # attn_output: torch.Tensor = self.attn_impl_func(  # type: ignore
+        #     query_states,
+        #     key_states,
+        #     value_states,
+        #     cu_seqlens_q=seq_ctx.cu_seq_lens_q,
+        #     cu_seqlens_k=seq_ctx.cu_seq_lens_k,
+        #     max_seqlen_q=seq_ctx.max_length_q,
+        #     max_seqlen_k=seq_ctx.max_length_k,
+        #     window_size=self.window_size,
+        #     dropout_p=self.dropout,
+        #     softmax_scale=self.scaling,
+        #     causal=True,
+        #     deterministic=True,
+        #     **kwargs,
+        # )
+        flash_fn, flash_varlen_fn, pad_fn, unpad_fn, _  = _lazy_imports("flash_attention_2")
+        attn_output = flash_varlen_fn(query_states.transpose(1, 2)[0],key_states.transpose(1, 2)[0],value_states.transpose(1, 2)[0],cu_seqlens_q=seq_ctx.cu_seq_lens_q,cu_seqlens_k=seq_ctx.cu_seq_lens_k,max_seqlen_q=seq_ctx.max_length_q,max_seqlen_k=seq_ctx.max_length_k,softmax_scale=self.scaling,causal=True,deterministic=True)
+        attn_output = attn_output.unsqueeze(0)
+        # attn_output = _flash_attention_forward(
+        #     query_states.transpose(1, 2),
+        #     key_states.transpose(1, 2),
+        #     value_states.transpose(1, 2),
+        #     query_length=query_states.shape[2],
+        #     is_causal=True,
+        #     dropout=0,
+        #     softmax_scale=self.scaling,
+        #     deterministic=True,
+        #     cu_seq_lens_q=seq_ctx.cu_seq_lens_q,
+        #     cu_seq_lens_k=seq_ctx.cu_seq_lens_k,
+        #     max_length_q=seq_ctx.max_length_q,
+        #     max_length_k=seq_ctx.max_length_k,
+        #     attn_implementation='flash_attention_2',
+        #     attention_mask=None,
+        # )
 
         if seq_ctx.sequence_parallel_mesh and seq_ctx.sequence_parallel_mesh.size() > 1:
             attn_output = ulysses_all_to_all(

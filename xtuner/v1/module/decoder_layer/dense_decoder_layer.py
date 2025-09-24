@@ -12,6 +12,7 @@ from xtuner.v1.utils import ForwardState
 
 from ..linear.linear import _Linear
 
+import os
 
 class DenseMLP(nn.Module):
     def __init__(

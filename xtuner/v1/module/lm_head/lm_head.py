@@ -32,7 +32,7 @@ class LMHead(nn.Linear):
             w = self.weight
             b = self.bias
         if loss_ctx is None:
-            logits = F.linear(hidden_states, w, b)
+            logits = F.linear(hidden_states, w, b).float()
             return None, logits
         else:
             return loss_ctx.forward(hidden_states, w, b)

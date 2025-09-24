@@ -148,6 +148,6 @@ class BaseLossContext(nn.Module, ABC, Generic[LossContextInputItem]):
             loss, logits = self.chunk_mode(hidden_states, head_weight, head_bias, self.loss_kwargs)
 
         # Step 2.c in the loss calculation
-        if dist.is_initialized():
-            loss = all_reduce(loss, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
+        # if dist.is_initialized():
+        #     loss = all_reduce(loss, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
         return loss, logits

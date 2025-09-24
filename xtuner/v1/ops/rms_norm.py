@@ -8,9 +8,14 @@ class RMSNormProtocol(Protocol):
 
 
 def native_rms_norm(x: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
-    from torch.nn import functional as F
+    # from torch.nn import functional as F
 
-    return F.rms_norm(x, weight.shape, weight, epsilon)
+    # return F.rms_norm(x, weight.shape, weight, epsilon)
+    input_dtype = x.dtype
+    x = x.to(torch.float32)
+    variance = x.pow(2).mean(-1, keepdim=True)
+    x = x * torch.rsqrt(variance + epsilon)
+    return weight * x.to(input_dtype)
 
 
 def npu_rms_norm(x: torch.Tensor, weight: torch.Tensor, epsilon: float) -> torch.Tensor:
