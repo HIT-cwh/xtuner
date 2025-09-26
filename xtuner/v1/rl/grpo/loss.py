@@ -79,6 +79,7 @@ class GRPOLossContext(BaseLossContext[RLLossContextInputItem]):
         shifted_labels_list = [item.shifted_labels for item in data_batches]
 
         # Compute the denominator used in the global calibration of the loss
+        grad_acc = len(data_batches)
         rank_grad_tokens = sum((labels != loss_cfg.ignore_idx).sum() for labels in shifted_labels_list)
         rank_grad_tokens = cast(torch.Tensor, rank_grad_tokens)
         global_grad_tokens = rank_grad_tokens
@@ -97,7 +98,9 @@ class GRPOLossContext(BaseLossContext[RLLossContextInputItem]):
             advantages = item.advantages
             assert item.old_logprobs is not None, "old_logprobs can not be None"
             # compute loss weight
-            policy_loss_weight = torch.ones_like(shifted_labels, dtype=torch.float32) / global_grad_tokens
+            # policy_loss_weight = torch.ones_like(shifted_labels, dtype=torch.float32) / global_grad_tokens
+            rank_grad_tokens = (shifted_labels != loss_cfg.ignore_idx).sum()
+            policy_loss_weight = torch.ones_like(shifted_labels, dtype=torch.float32) / rank_grad_tokens / grad_acc
             policy_loss_weight[shifted_labels == loss_cfg.ignore_idx] = 0.0
             if loss_cfg.use_kl_loss:
                 assert item.ref_logprobs is not None, "ref_logprobs can not be None when use_kl_loss=True"
@@ -113,6 +116,7 @@ class GRPOLossContext(BaseLossContext[RLLossContextInputItem]):
                 policy_loss_weight=policy_loss_weight,
                 ref_logprobs=ref_logprobs,
                 kl_loss_weight=kl_loss_weight,
+                cu_seq_len=cu_seq_lens_list[i],
             )
             batches_loss_kwargs.append(loss_kwargs)
         return batches_loss_kwargs
@@ -135,7 +139,7 @@ class GRPOLossContext(BaseLossContext[RLLossContextInputItem]):
         advantages = loss_kwargs.advantages
         policy_loss_weight = loss_kwargs.policy_loss_weight
 
-        logprobs = gather_logprobs(logits, shifted_labels)
+        logprobs = gather_logprobs(logits.to(torch.float64), shifted_labels).float()
         policy_loss_fn = get_policy_loss_fn(self.loss_cfg.policy_loss_cfg.get("loss_type", "vanilla"))
         loss = policy_loss_fn(
             logprobs,
@@ -144,7 +148,11 @@ class GRPOLossContext(BaseLossContext[RLLossContextInputItem]):
             policy_loss_weight,
             self.loss_cfg.policy_loss_cfg,
         )
-        ratio = (logprobs - old_logprobs.detach()).exp()
+        mask = shifted_labels[0] != -100
+        ratio = (logprobs[0, mask] - old_logprobs[0, mask].detach()).exp()
+        ratio_max = ratio.max() if ratio.numel() > 0 else ratio.new_ones(())
+        # if torch.distributed.get_rank() == 6:
+        #     breakpoint()
 
         if self.loss_cfg.use_kl_loss:
             ref_logprobs = loss_kwargs.ref_logprobs
@@ -155,4 +163,4 @@ class GRPOLossContext(BaseLossContext[RLLossContextInputItem]):
             kl_loss = kl_penalty(logprobs, ref_logprobs, kl_loss_weight, self.loss_cfg.kl_loss_type)
             loss = loss + kl_loss
 
-        return loss, (logits, ratio.max())
+        return loss, (logits, ratio_max)

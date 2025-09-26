@@ -275,8 +275,8 @@ class TrainEngine:
             grad_acc_loss.append(llm_loss.detach().clone().item())
             step_loss += llm_loss.detach().clone()
 
-            if dist.is_initialized():
-                llm_loss = all_reduce(llm_loss, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
+            # if dist.is_initialized():
+            #     llm_loss = all_reduce(llm_loss, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
 
             loss = llm_loss
             step_llm_loss += llm_loss.detach().clone()
@@ -386,7 +386,7 @@ class TrainEngine:
             raise NotImplementedError
         return global_norm
 
-    def clip_grad_norm(self):
+    def clip_grad_norm1(self):
         self.model.scale_and_reduce_grad()
         params = self.model.trainable_parameters()
         grads = [p.grad for _, p in params if p.grad is not None]
@@ -407,6 +407,25 @@ class TrainEngine:
                 for g in grads:
                     g.mul_(clip_coef_clamped_device)
         return grad_norm
+    
+    def clip_grad_norm(self):
+        from torch.nn.utils.clip_grad import _clip_grads_with_norm_, _get_total_norm
+
+        parameters = self.model.parameters()
+        max_norm = 1
+        norm_type = 2.0
+        if isinstance(parameters, torch.Tensor):
+            parameters = [parameters]
+        else:
+            # prevent generators from being exhausted
+            parameters = list(parameters)
+        grads = [p.grad for p in parameters if p.grad is not None]
+        grads = grads[-1:] + grads[2:-1] + grads[:2] 
+        total_norm = _get_total_norm(grads, norm_type, False, None)
+        total_norm = total_norm * 1
+        total_norm = total_norm.to(torch.cuda.current_device(), non_blocking=True)
+        _clip_grads_with_norm_(parameters, max_norm, total_norm, None)
+        return total_norm
 
     def step_optimizer(self, grad_norm):
         """Step the optimizer to update the model parameters."""

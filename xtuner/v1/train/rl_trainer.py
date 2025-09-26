@@ -6,6 +6,8 @@ from datetime import datetime
 from pathlib import Path
 from shutil import rmtree
 from typing import cast
+import os
+import math
 
 import numpy as np
 import ray
@@ -286,6 +288,7 @@ class RLTrainer:
             self._save_trajectories(eval_data_groups, trajectory_save_path)
             self.logger.info(f"Initial rollout evaluate scores {scores} and start training")
         for rollout_idx in range(1, self._rollout_steps + 1):
+        # for rollout_idx in range(1, 106):
             data_groups = ray.get(self._rollout_dataflow.run.remote())
             time.sleep(3)
             ray.get(self._rollout_env_controller.offload.remote())
@@ -297,13 +300,18 @@ class RLTrainer:
             data_batches, data_info = self._prepare_train_data(data_groups, self._train_worker_cfg.pack_max_length)
             self.logger.info(f"Prepared {len(data_batches)} training data batches")
             self.logger.info(f"DataInfo {data_info}")
+            # data_batches, _ = self._prepare_train_data(rollout_idx)
             ray.get(
                 self._train_controller.fit.remote(
-                    data_batches, pack_max_length=self._train_worker_cfg.pack_max_length, rollout_idx=rollout_idx
+                    data_batches, 
+                    # [],
+                    pack_max_length=self._train_worker_cfg.pack_max_length, 
+                    optimizer_steps=self._train_worker_cfg.optimizer_steps,
+                    rollout_idx=rollout_idx
                 )
             )
             ray.get(self._train_controller.offload.remote(target="optimizer"))
-            self._maybe_save_hf()
+            # self._maybe_save_hf()
             ray.get(self._rollout_env_controller.onload_weights.remote())
             ray.get(self._train_controller.update_weights.remote())
             self.logger.info("update weights done!!!")
@@ -317,6 +325,63 @@ class RLTrainer:
                 self._save_trajectories(eval_data_groups, trajectory_save_path)
                 self.logger.info(f"evaluate idx {rollout_idx} scores {scores}")
             self._cur_epoch += 1
+    
+    def _prepare_train_data1(self, rollout_idx):
+        mapping = {}
+        for step in range(16):
+            pattern = f'rollout_step{rollout_idx}_step{step}_'
+            pths = []
+            for root, dirs, files in os.walk('/mnt/shared-storage-user/caoweihan/projects/verl/trajectory'):
+                for file in files:
+                    if file.endswith('.pth'):
+                        absolute_path = os.path.join(root, file)
+                        if pattern in absolute_path:
+                            pths.append(absolute_path)
+            grad_acc = len(pths) // 8
+            seq_ctx_per_rank = []
+            for rank in range(8):
+                rank_per_acc = {}
+                for acc in range(grad_acc):
+                    data = torch.load(f'/mnt/shared-storage-user/caoweihan/projects/verl/trajectory/rank{rank}_rollout_step{rollout_idx}_step{step}_acc{acc}_model_inputs.pth', map_location='cpu')
+                    input_ids = data['input_ids']
+                    n = input_ids.size(0)
+                    sp_size = 1
+                    n_per_rank = math.ceil(n / sp_size)
+                    sp_rank = rank % sp_size
+                    input_ids = input_ids[sp_rank * n_per_rank : (sp_rank + 1) * n_per_rank]
+                    attention_mask = data['attention_mask'][sp_rank * n_per_rank : (sp_rank + 1) * n_per_rank]
+                    input_ids_flatten = input_ids.view(-1)[attention_mask.view(-1) != 0]
+                    input_ids_list = torch.split(input_ids_flatten, attention_mask.sum(-1).cpu().tolist())
+                    # seq_ctx = SequenceContext.from_input_ids([ids.view(1, -1) for ids in input_ids_list], device="cuda")
+                    response_mask = data['response_mask'][sp_rank * n_per_rank : (sp_rank + 1) * n_per_rank]
+                    response_lens = response_mask.sum(-1).tolist()
+                    prompt_ids_list = [input_ids_list[i][:-response_lens[i]] for i in range(len(response_lens))]
+                    response_ids_list = [input_ids_list[i][-response_lens[i]:] for i in range(len(response_lens))]
+                    input_ids_list = [torch.cat([p, r]) for p, r in zip(prompt_ids_list, response_ids_list)]
+                    shifted_labels_list = [
+                        torch.cat([
+                            torch.full((p.shape[0] - 1, ), -100, dtype=r.dtype), 
+                            r, 
+                            torch.full((1, ), -100, dtype=r.dtype)]
+                        ) 
+                        for p, r in zip(prompt_ids_list, response_ids_list)
+                    ]
+                    adv_list = data['response_mask'][sp_rank * n_per_rank : (sp_rank + 1) * n_per_rank][:, 0].tolist()
+                    for prompt_ids, input_ids, shifted_labels, adv in zip(prompt_ids_list, input_ids_list, shifted_labels_list, adv_list):
+                        data = dict(
+                            seq_ctx=SequenceContext.from_input_ids((input_ids.view(1, -1),), device="cpu"),
+                            shifted_labels=shifted_labels.view(1, -1),
+                            advantage=adv,
+                        )
+                        prompt_ids = tuple(prompt_ids)
+                        if prompt_ids in mapping:
+                            mapping[prompt_ids].append(data)
+                        else:
+                            mapping[prompt_ids] = [data]
+        data_batches = list(mapping.values())
+        # random.shuffle(data_batches)  # shuffle in groups
+        return data_batches, {}
+
 
     # TODO: advantage 是在 DataFlow 里算好，还是在 train controller 里算？
     # 因为可能有根据 advantage 来判断数据能否进 rl 训练的需求。暂时先放在这
@@ -338,6 +403,7 @@ class RLTrainer:
             advantages = (rewards - rewards.mean(0)) / (rewards.std(0) + 1e-8)
 
             prompt_repeat_k = len(group)
+            data_batches_group = []
             for i in range(prompt_repeat_k):
                 item = group[i]["response_str"]
                 response_ids = self.tokenizer(item, return_tensors="pt")["input_ids"].flatten().tolist()
@@ -353,14 +419,14 @@ class RLTrainer:
                     shifted_labels = shifted_labels[:pack_max_length]
                 input_ids = torch.tensor(input_ids, dtype=torch.int64).unsqueeze(0)
                 shifted_labels = torch.tensor(shifted_labels, dtype=torch.int64).unsqueeze(0)
-                data_batches.append(
+                data_batches_group.append(
                     dict(
                         seq_ctx=SequenceContext.from_input_ids((input_ids,), device="cpu"),
                         shifted_labels=shifted_labels,
                         advantage=advantages[i].item(),
                     )
                 )
-        random.shuffle(data_batches)
+            data_batches.append(data_batches_group)
 
         advantages_list = np.array(advantages_list)
         info_dict = {
@@ -379,6 +445,7 @@ class RLTrainer:
             "prompt_len/min": np.min(prompt_len_list),
             "prompt_len/max": np.max(prompt_len_list),
         }
+        random.shuffle(data_batches)  # shuffle in groups
         return data_batches, info_dict
 
     def _save_trajectories(self, data_groups, save_path):
@@ -483,8 +550,8 @@ class RLTrainer:
         return logger
 
     def _set_deterministic(self):
-        if XTUNER_DETERMINISTIC:
-            torch.use_deterministic_algorithms(True, warn_only=True)
+        # if XTUNER_DETERMINISTIC:
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
     def _set_random_seed(self, seed: int):
         set_random_seed(seed)

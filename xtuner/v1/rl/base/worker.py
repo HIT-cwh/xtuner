@@ -223,7 +223,7 @@ class TrainingWorker(SingleAcceleratorWorker):
     ) -> list[RLLossContextInputItem]:
         for seq_ctx, loss_ctx_input in zip(seq_ctx_list, loss_ctx_input_list):
             output = self._engine.forward_only(seq_ctx=seq_ctx)
-            loss_ctx_input.old_logprobs = gather_logprobs(output["logits"], loss_ctx_input.shifted_labels)
+            loss_ctx_input.old_logprobs = gather_logprobs(output["logits"].to(torch.float64), loss_ctx_input.shifted_labels).float()
         return loss_ctx_input_list
 
     def compute_ref_logprobs(
@@ -238,14 +238,133 @@ class TrainingWorker(SingleAcceleratorWorker):
             loss_ctx_input.ref_logprobs = ref_logprobs
         self._ref_model.to_device("cpu")
         return loss_ctx_input_list
+    
+    def fit1(self, data_batches: list[list[WorkerInputItem]], rollout_idx: int):
+        rank = dist.get_rank()
+        loss_ctx_input_list_list = []
+        seq_ctx_list_list = []
+        for step_idx in range(16):
+            pths = []
+            pattern = f'rank{rank}_rollout_step{rollout_idx}_step{step_idx}_'
+            for root, dirs, files in os.walk('/mnt/shared-storage-user/caoweihan/projects/verl/trajectory'):
+                for file in files:
+                    if file.endswith('.pth'):
+                        absolute_path = os.path.join(root, file)
+                        if pattern in absolute_path:
+                            pths.append(absolute_path)
+            grad_acc = len(pths)
+            seq_ctx_list = []
+            loss_ctx_input_list = []
+            old_logprob_list = []
+            for acc in range(grad_acc):
+                data = torch.load(f'/mnt/shared-storage-user/caoweihan/projects/verl/trajectory/rank{rank}_rollout_step{rollout_idx}_step{step_idx}_acc{acc}_model_inputs.pth', map_location=DEVICE)
+                input_ids = data['input_ids']
+                n = input_ids.size(0)
+                sp_size = 1
+                n_per_rank = math.ceil(n / sp_size)
+                sp_rank = rank % sp_size
+                input_ids = input_ids[sp_rank * n_per_rank : (sp_rank + 1) * n_per_rank]
+                attention_mask = data['attention_mask'][sp_rank * n_per_rank : (sp_rank + 1) * n_per_rank]
+                input_ids_flatten = input_ids.view(-1)[attention_mask.view(-1) != 0]
+                input_ids_list = torch.split(input_ids_flatten, attention_mask.sum(-1).cpu().tolist())
+                seq_ctx = SequenceContext.from_input_ids([ids.view(1, -1) for ids in input_ids_list], device="cuda")
+                seq_ctx_list.append(seq_ctx)
+
+                response_mask = data['response_mask'][sp_rank * n_per_rank : (sp_rank + 1) * n_per_rank]
+                response_lens = response_mask.sum(-1).tolist()
+                prompt_ids_list = [input_ids_list[i][:-response_lens[i]] for i in range(len(response_lens))]
+                response_ids_list = [input_ids_list[i][-response_lens[i]:] for i in range(len(response_lens))]
+                labels_list = []
+                for i in range(len(response_lens)):
+                    labels = [-100] * (len(prompt_ids_list[i]) - 1) + response_ids_list[i].tolist() + [-100]
+                    labels_list.extend(labels)
+                shifted_labels = torch.tensor(labels_list, device=DEVICE)
+                advantages = data['advantages'][sp_rank * n_per_rank : (sp_rank + 1) * n_per_rank].view(-1)[response_mask.view(-1) != 0]
+                advantages_list = list(torch.split(advantages, response_mask.sum(-1).cpu().tolist()))
+                for i in range(len(advantages_list)):
+                    advantages_list[i] = torch.cat([torch.full((prompt_ids_list[i].size(0),), advantages_list[i][0].item(), device=DEVICE, dtype=advantages_list[i].dtype), advantages_list[i]])
+                advantages = torch.cat(advantages_list, dim=0)
+
+                # response_mask_copy = response_mask.clone()
+                # for i, idx in enumerate(response_mask.sum(-1).tolist()):
+                #     response_mask_copy[i, idx] = 1
+                old_log_probs = data['old_log_probs'][sp_rank * n_per_rank : (sp_rank + 1) * n_per_rank].view(-1)[response_mask.view(-1) != 0]
+                # old_logprob_list.append(old_log_probs)
+                old_log_probs_list = list(torch.split(old_log_probs, response_mask.sum(-1).cpu().tolist()))
+                for i in range(len(old_log_probs_list)):
+                    old_log_probs = [0] * (prompt_ids_list[i].size(0) - 1) + old_log_probs_list[i].flatten().tolist() + [0]
+                    old_log_probs = torch.Tensor(old_log_probs).to(device='cuda', dtype=old_log_probs_list[i].dtype)
+                    old_log_probs_list[i] = old_log_probs
+                #     old_log_probs_list[i] = torch.cat([torch.full((prompt_ids_list[i].size(0) - 1,), 0.0, device=DEVICE, dtype=old_log_probs_list[i].dtype), old_log_probs_list[i]])
+                old_log_probs = torch.cat(old_log_probs_list, dim=0).view(1, -1)
+                loss_scale_factor = data['response_mask'].shape[0] / 64
+
+                loss_ctx_input_list.append(
+                    RLLossContextInputItem(
+                        shifted_labels=shifted_labels.view(1, -1),
+                        advantages=advantages.view(1, -1),
+                        loss_scale_factor=loss_scale_factor,
+                        # old_logprobs=old_log_probs,
+                    )
+                )
+            loss_ctx_input_list = self.compute_actor_logprobs(seq_ctx_list, loss_ctx_input_list)
+            loss_ctx_input_list_list.append(loss_ctx_input_list)
+            seq_ctx_list_list.append(seq_ctx_list)
+            
+        for step_idx in range(16):
+            loss_ctx_input_list = loss_ctx_input_list_list[step_idx]
+            seq_ctx_list = seq_ctx_list_list[step_idx]
+            # loss_ctx_input_list = self.compute_actor_logprobs(seq_ctx_list, loss_ctx_input_list)
+            loss_cfg = self.config.loss_cfg
+            LossContext = loss_cfg.loss_ctx_cls
+            batches_loss_kwargs = LossContext.build_batches_loss_kwargs(
+                loss_ctx_input_list, loss_cfg, 
+                [seq_ctx.cu_seq_lens_q for seq_ctx in seq_ctx_list]
+                )
+            engine_input = []
+            assert len(seq_ctx_list) == len(batches_loss_kwargs)
+            for seq_ctx, loss_kwargs in zip(seq_ctx_list, batches_loss_kwargs):
+                loss_ctx = LossContext(
+                    loss_cfg=loss_cfg,
+                    loss_kwargs=loss_kwargs,
+                )
+                engine_input.append(
+                    ModelItem(
+                        seq_ctx=seq_ctx,
+                        loss_ctx=loss_ctx,
+                    )
+                )
+            
+            os.environ['stop'] = '1'
+            loss_log, other_log = self._engine.train_step(
+                data_batches=engine_input,
+            )
+            os.environ['stop'] = '0'
+            grad_norm = self._engine.clip_grad_norm()
+            grad_norm = grad_norm * 1
+            self._engine.step_optimizer(grad_norm)
+            
+            current_lr = self._engine.optimizer.param_groups[0]['lr']
+            logger.info(f"current_lr {current_lr} grad_norm: {grad_norm}")
+            log_info = dict()
+            log_info.update(loss_log)
+            log_info.update(other_log)
+            log_info["grad_norm"] = grad_norm.item()
+            log_str = ", ".join(
+                f"{key}={value:.4f}" if isinstance(value, float) else f"{key}={value}"
+                for key, value in log_info.items()
+            )
+            log_str = f"Rollout {rollout_idx} Step {step_idx}: " + log_str
+            logger.info(log_str)
+            
+        # breakpoint()
 
     def fit(self, data_batches: list[WorkerInputItem], rollout_idx: int):
-        num_batches = len(data_batches)
-        iters_per_step = math.ceil(num_batches / self._optimizer_steps)
-        if num_batches < self._optimizer_steps:
-            logger.info(
-                f"Optimizer only step once because num_batches {num_batches} < optimizer_steps {self._optimizer_steps}."
-            )
+        iters_per_step = [len(data) for data in data_batches]
+        accum_iters = [0]
+        for iters in iters_per_step:
+            accum_iters.append(accum_iters[-1] + iters)
+        data_batches = sum(data_batches, [])
 
         seq_ctx_list: list[SequenceContext] = []
         loss_ctx_input_list: list[RLLossContextInputItem] = []
@@ -303,13 +422,16 @@ class TrainingWorker(SingleAcceleratorWorker):
             avg_kl_div = kl_div_sum / global_grad_tokens if global_grad_tokens > 0 else 0
             logger.info(f"Rollout {rollout_idx}: avg KL divergence: {avg_kl_div:.4f}")
 
-        for i in range(0, len(seq_ctx_list), iters_per_step):
-            batches_seq_ctx = seq_ctx_list[i : i + iters_per_step]
-            batches_loss_ctx_input = loss_ctx_input_list[i : i + iters_per_step]
+        for step_idx in range(self._optimizer_steps):
+            batches_seq_ctx = seq_ctx_list[accum_iters[step_idx] : accum_iters[step_idx + 1]]
+            batches_loss_ctx_input = loss_ctx_input_list[accum_iters[step_idx] : accum_iters[step_idx + 1]]
 
             loss_cfg = self.config.loss_cfg
             LossContext = loss_cfg.loss_ctx_cls
-            batches_loss_kwargs = LossContext.build_batches_loss_kwargs(batches_loss_ctx_input, loss_cfg)
+            batches_loss_kwargs = LossContext.build_batches_loss_kwargs(
+                batches_loss_ctx_input, loss_cfg,
+                [seq_ctx.cu_seq_lens_q for seq_ctx in seq_ctx_list]
+            )
             engine_input = []
             for seq_ctx, loss_kwargs in zip(batches_seq_ctx, batches_loss_kwargs):
                 loss_ctx = LossContext(
@@ -327,6 +449,7 @@ class TrainingWorker(SingleAcceleratorWorker):
                 data_batches=engine_input,
             )
             grad_norm = self._engine.clip_grad_norm()
+            grad_norm = grad_norm * 1
 
             # if i == 0 and grad_norm > 100:
             #     logger.info(f"{loss_log['total_loss'], other_log['grad_acc_loss'], other_log['max_ratio'], grad_norm}")
@@ -338,12 +461,13 @@ class TrainingWorker(SingleAcceleratorWorker):
             log_info = dict()
             log_info.update(loss_log)
             log_info.update(other_log)
+            log_info["max_ratio_max"] = max(log_info["max_ratio"])
             log_info["grad_norm"] = grad_norm.item()
             log_str = ", ".join(
                 f"{key}={value:.4f}" if isinstance(value, float) else f"{key}={value}"
                 for key, value in log_info.items()
             )
-            log_str = f"Rollout {rollout_idx} Step {i}: " + log_str
+            log_str = f"Rollout {rollout_idx} Step {step_idx}: " + log_str
             logger.info(log_str)
 
     def save_hf(self, hf_dir: str, save_dtype: torch.dtype = torch.bfloat16):
@@ -395,7 +519,7 @@ class TrainingWorker(SingleAcceleratorWorker):
             "lmdeploy_backend", "pytorch"
         )
 
-    def update_weights(self):
+    def update_weights1(self):
         """Update the model weights."""
         self.endpoints["update_weights"] = "update_weights"
         assert self.rollout_device_mesh is not None
@@ -537,108 +661,92 @@ class TrainingWorker(SingleAcceleratorWorker):
     #     DEVICE_MODULE.empty_cache()
     #     return
 
-    # def update_weights(self):
-    #     """Update the model weights."""
-    #     self.endpoints["update_weights"] = "update_weights"
-    #     assert self.rollout_device_mesh is not None
+    def update_weights(self):
+        """Update the model weights."""
+        self.endpoints["update_weights"] = "update_weights"
+        assert self.rollout_device_mesh is not None
 
-    #     model = self._engine.model
-    #     DEVICE_MODULE.empty_cache()
+        model = self._engine.model
+        DEVICE_MODULE.empty_cache()
 
-    #     saved_keys = []
-    #     gather_duration = []
-    #     weight_duration = []
-    #     reshard_duration = []
+        saved_keys = []
+        gather_duration = []
+        weight_duration = []
+        reshard_duration = []
 
-    #     # update decoder layers
-    #     for i, layer in tqdm.tqdm(model.layers.items(), desc="[gather weight]"):
-    #         start = time.perf_counter()
-    #         layer.unshard()
-    #         layer_state_dict = {}
+        # update decoder layers
+        for i, layer in tqdm.tqdm(model.layers.items(), desc="[gather weight]"):
+            start = time.perf_counter()
+            layer.unshard()
+            layer_state_dict = {}
 
-    #         for sub_name, param in layer.named_parameters():
-    #             if "_checkpoint_wrapped_module." in sub_name:
-    #                 sub_name = sub_name.replace("_checkpoint_wrapped_module.", "")
-    #             if isinstance(param, DTensor):
-    #                 param = param.to_local()
+            for sub_name, param in layer.named_parameters():
+                if "_checkpoint_wrapped_module." in sub_name:
+                    sub_name = sub_name.replace("_checkpoint_wrapped_module.", "")
+                if isinstance(param, DTensor):
+                    param = param.to_local()
 
-    #             if isinstance(param, WeightWithDynamicTilewiseFloat8CastTensor):
-    #                 param = param._tensor
+                param = param.to(DEVICE)
+                name = f"model.layers.{i}.{sub_name}"
+                saved_keys.append(name.replace("model.", ""))
+                if ".experts." in name and ".mlp." not in name:
+                    name = name.replace(".experts.", ".mlp.experts.")
+                if ".gate." in name and ".mlp." not in name:
+                    name = name.replace(".gate.", ".mlp.gate.")
+                layer_state_dict[name] = param.detach()
+            gather_duration.append(time.perf_counter() - start)
+            start = time.perf_counter()
+            self.request_update_params(layer_state_dict, finished=True)
+            weight_duration.append(time.perf_counter() - start)
 
-    #             if isinstance(param, Float8Tensor):
-    #                 scale_name = f"model.layers.{i}.{sub_name}_scale_inv"
-    #                 assert "fused_w1w3" in sub_name or "fused_w2" in sub_name
-    #                 # save scale_inv parameter to state_dict
-    #                 scale_tensor = param._scale
-    #                 quant_tensor = param._data
-    #                 ep_mesh = model.ep_mesh
-    #                 if ep_mesh.size() > 1:
-    #                     scale_tensor = torch.cat(dist.nn.all_gather(scale_tensor, group=ep_mesh.get_group()), dim=0)
-    #                     quant_tensor = torch.cat(dist.nn.all_gather(quant_tensor, group=ep_mesh.get_group()), dim=0)
-    #                 layer_state_dict[scale_name] = scale_tensor.detach()
-    #                 # set `param` which will be added to state_dict at the bottom of the for-block
-    #                 param = quant_tensor
+            start = time.perf_counter()
+            del layer_state_dict
+            layer.reshard()
+            reshard_duration.append(time.perf_counter() - start)
 
-    #             param = param.to(DEVICE)
-    #             name = f"model.layers.{i}.{sub_name}"
-    #             saved_keys.append(name.replace("model.", ""))
-    #             if ".experts." in name and ".mlp." not in name:
-    #                 name = name.replace(".experts.", ".mlp.experts.")
-    #             if ".gate." in name and ".mlp." not in name:
-    #                 name = name.replace(".gate.", ".mlp.gate.")
-    #             layer_state_dict[name] = param.detach()
-    #         gather_duration.append(time.perf_counter() - start)
-    #         start = time.perf_counter()
-    #         self.request_update_params(layer_state_dict, finished=True)
-    #         breakpoint()
-    #         weight_duration.append(time.perf_counter() - start)
+        if dist.get_rank() == 0:
+            logger.debug(
+                f"Rank 0 Gather decoder layers done, total {sum(gather_duration):.2f}s, avg "
+                f"{sum(gather_duration) / len(gather_duration):.2f}s"
+            )
+            logger.debug(
+                f"Rank 0 migrate/save decoder layers done, total {sum(weight_duration):.2f}s, avg "
+                f"{sum(weight_duration) / len(weight_duration):.2f}s"
+            )
+            logger.debug(
+                f"Rank 0 reshard decoder layers done, total {sum(reshard_duration):.2f}s, avg "
+                f"{sum(reshard_duration) / len(reshard_duration):.2f}s"
+            )
 
-    #         start = time.perf_counter()
-    #         del layer_state_dict
-    #         layer.reshard()
-    #         reshard_duration.append(time.perf_counter() - start)
+        # update other params
+        # model.norm.unshard()
+        # model.lm_head.unshard()
+        model.unshard()
+        model.embed_tokens.unshard()
+        others_state_dict = {}
+        for name, param in model.named_parameters():
+            if "_checkpoint_wrapped_module." in name:
+                continue
+            if name not in saved_keys:
+                saved_keys.append(name)
+                if name == "norm.weight":
+                    name = "model.norm.weight"
+                if name == "embed_tokens.weight":
+                    name = "model.embed_tokens.weight"
+                if isinstance(param, DTensor):
+                    param = param.to_local()
+                others_state_dict[name] = param.detach()
+        self.request_update_params(others_state_dict, finished=True)
+        # model.norm.reshard()
+        # model.lm_head.reshard()
+        model.reshard()
+        model.embed_tokens.reshard()
+        del others_state_dict
+        del param
 
-    #     if dist.get_rank() == 0:
-    #         logger.debug(
-    #             f"Rank 0 Gather decoder layers done, total {sum(gather_duration):.2f}s, avg "
-    #             f"{sum(gather_duration) / len(gather_duration):.2f}s"
-    #         )
-    #         logger.debug(
-    #             f"Rank 0 migrate/save decoder layers done, total {sum(weight_duration):.2f}s, avg "
-    #             f"{sum(weight_duration) / len(weight_duration):.2f}s"
-    #         )
-    #         logger.debug(
-    #             f"Rank 0 reshard decoder layers done, total {sum(reshard_duration):.2f}s, avg "
-    #             f"{sum(reshard_duration) / len(reshard_duration):.2f}s"
-    #         )
-
-    #     # update other params
-    #     model.norm.unshard()
-    #     model.lm_head.unshard()
-    #     model.embed_tokens.unshard()
-    #     others_state_dict = {}
-    #     for name, param in model.named_parameters():
-    #         if "_checkpoint_wrapped_module." in name:
-    #             continue
-    #         if name not in saved_keys:
-    #             saved_keys.append(name)
-    #             if name == "norm.weight":
-    #                 name = "model.norm.weight"
-    #             if name == "embed_tokens.weight":
-    #                 name = "model.embed_tokens.weight"
-    #             if isinstance(param, DTensor):
-    #                 param = param.to_local()
-    #             others_state_dict[name] = param.detach()
-    #     self.request_update_params(others_state_dict, finished=True)
-    #     model.norm.reshard()
-    #     model.lm_head.reshard()
-    #     model.embed_tokens.reshard()
-    #     del others_state_dict
-    #     del param
-
-    #     dist.barrier()
-    #     DEVICE_MODULE.empty_cache()
-    #     return
+        dist.barrier()
+        DEVICE_MODULE.empty_cache()
+        return
 
     def request_update_params(self, state_dict, finished=False):
         cpu_mesh = self.rollout_device_mesh["engine_parallel"]

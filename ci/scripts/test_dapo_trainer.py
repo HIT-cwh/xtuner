@@ -172,7 +172,7 @@ def main(args):
             use_kl_loss=False,
             kl_loss_coef=0.0,
             kl_loss_type="low_var_kl",
-            mode="chunk",
+            mode="eager",
             chunk_size=512),
         lr_cfg=LRConfig(lr_type="constant", warmup_ratio=0, lr_min=1e-6),
         fsdp_cfg=FSDPConfig(

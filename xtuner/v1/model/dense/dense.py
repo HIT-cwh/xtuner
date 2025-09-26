@@ -30,6 +30,7 @@ from xtuner.v1.utils import (
     get_device,
     get_logger,
 )
+from xtuner.v1.ops import rms_norm
 
 
 DEVICE = get_device()
@@ -179,7 +180,9 @@ class Dense(BaseModel):
 
         self._maybe_compile_layers()
         mp_policy = MixedPrecisionPolicy(
-            param_dtype=self.fsdp_config.param_dtype, reduce_dtype=fsdp_config.reduce_dtype
+            param_dtype=self.fsdp_config.param_dtype, 
+            reduce_dtype=torch.float32,
+            cast_forward_inputs=True,
         )
         num_recompute_layers = int(self.config.num_hidden_layers * self.fsdp_config.recompute_ratio)
 
@@ -215,21 +218,21 @@ class Dense(BaseModel):
             offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
         )
 
-        fully_shard(
-            self.norm,
-            mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
-            mp_policy=mp_policy,
-            reshard_after_forward=self.fsdp_config.reshard_after_forward,
-            offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
-        )
+        # fully_shard(
+        #     self.norm,
+        #     mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
+        #     mp_policy=mp_policy,
+        #     reshard_after_forward=self.fsdp_config.reshard_after_forward,
+        #     offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+        # )
 
-        fully_shard(
-            self.lm_head,
-            mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
-            mp_policy=mp_policy,
-            reshard_after_forward=self.fsdp_config.reshard_after_forward,
-            offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
-        )
+        # fully_shard(
+        #     self.lm_head,
+        #     mesh=self.fsdp_mesh if self.hsdp_mesh is None else self.hsdp_mesh,
+        #     mp_policy=mp_policy,
+        #     reshard_after_forward=self.fsdp_config.reshard_after_forward,
+        #     offload_policy=CPUOffloadPolicy() if self.fsdp_config.cpu_offload else None,
+        # )
 
         fully_shard(
             self,
@@ -293,7 +296,7 @@ class Dense(BaseModel):
                 w = self.norm.weight.to_local()
             else:
                 w = self.norm.weight
-        return F.rms_norm(input, w.shape, w, self.variance_epsilon)
+        return rms_norm(input, w, self.variance_epsilon)
 
     @staticmethod
     def patched_emb_forward(self, input):

@@ -143,7 +143,7 @@ class BaseLossContext(nn.Module, ABC, Generic[LossContextInputItem]):
             raise NotImplementedError("Loss does not support head_bias yet.")
 
         if self.loss_cfg.mode == "eager":
-            loss, logits = self.eager_mode(hidden_states, head_weight, head_bias, self.loss_kwargs)
+            loss, (logits, max_ratio) = self.eager_mode(hidden_states, head_weight, head_bias, self.loss_kwargs)
         else:
             loss, logits, max_ratio = self.chunk_mode(hidden_states, head_weight, head_bias, self.loss_kwargs)
 
