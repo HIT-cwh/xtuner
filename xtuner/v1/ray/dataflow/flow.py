@@ -71,6 +71,9 @@ class DataFlowConfig(BaseModel):
     extra_params: Annotated[Dict, Parameter(help="Extra parameters for rollout.")] = {}
 
 
+from xtuner.v1.utils import get_logger, log_format
+import sys
+
 @ray.remote
 class DataFlow:
     """A Ray actor that manages the data flow for reinforcement learning.
@@ -108,6 +111,12 @@ class DataFlow:
         self.failed_samples_count = 0
         self.logger = get_logger()
         self.target_batch_size = self.config.global_batch_size
+
+        # logger = get_logger()
+        # logger.remove()
+        # logger.add("work_dirs/dapo_math_7B_newlmdeploy_nogroup_sglang/flow.log", format=log_format(), backtrace=True, catch=True)
+        # logger.add(sys.stderr, format=log_format(rank=0))
+        # self.logger = logger
 
     def get_train_dataset_length(self):
         """Gets the length of the training dataset from the replay buffer."""

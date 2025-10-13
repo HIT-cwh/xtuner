@@ -13,9 +13,10 @@ from xtuner.v1.ray.config.worker import RolloutConfig
 from xtuner.v1.utils import get_logger
 
 from .worker import RolloutWorker
+from xtuner.v1.utils import get_logger, log_format
+import sys
 
-
-@ray.remote
+@ray.remote(max_concurrency=int(os.environ.get("XTUNER_MAX_CONCURRENT", 4096)))
 class RolloutController:
     """Controller for managing and coordinating multiple RolloutWorker
     actors."""
@@ -57,6 +58,11 @@ class RolloutController:
         )
         self.print_params_flag = True
         self.logger = get_logger()
+        # logger = get_logger()
+        # logger.remove()
+        # logger.add("work_dirs/dapo_math_7B_newlmdeploy_nogroup_sglang/flow.log", format=log_format(), backtrace=True, catch=True)
+        # logger.add(sys.stderr, format=log_format(rank=0))
+        # self.logger = logger
 
     def get_rollout_info(self):
         """Get information about the current rollout setup.
@@ -118,8 +124,8 @@ class RolloutController:
             )
         )
         # note: sglang infer with tp>1 will be supported as soon.
-        if os.environ.get("XTUNER_USE_SGLANG", "0") == "1":
-            assert self.config.tensor_parallel_size == 1, "tp_size > 1 is not supported for SGLang now."
+        # if os.environ.get("XTUNER_USE_SGLANG", "0") == "1":
+        #     assert self.config.tensor_parallel_size == 1, "tp_size > 1 is not supported for SGLang now."
         self.worker_server_urls = list(worker_server_urls_map.values())
         self.worker_cycler = cycle(self.active_rollout_workers)
         return engine_mesh_list, worker_server_urls_map

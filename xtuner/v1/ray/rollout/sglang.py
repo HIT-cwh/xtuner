@@ -11,7 +11,7 @@ from xtuner.v1.ray.config import RolloutConfig
 from .worker import RolloutWorker
 
 
-@ray.remote
+@ray.remote(max_concurrency=int(os.environ.get("XTUNER_MAX_CONCURRENT", 4096)))
 class SGLangWorker(RolloutWorker):
     def __init__(
         self,
@@ -70,12 +70,15 @@ class SGLangWorker(RolloutWorker):
         sglang_extra_params = self._transform_extra_params(extra_params)
         payload.update(sglang_extra_params)
         # self.logger.info(f"Request payload: {payload}")
+        # breakpoint()
         req = self.client.build_request(
             "POST",
             url,
             headers=headers,
             json=payload,
         )
+        # import debugpy
+        # debugpy.connect(("0.0.0.0", 28500))
         r = await self.client.send(req, stream=stream)
         r.raise_for_status()
         return r

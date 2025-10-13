@@ -1,5 +1,6 @@
 import asyncio
 from typing import List
+import os
 
 import ray
 
@@ -8,7 +9,7 @@ from xtuner.v1.ray.environment.base_env import BaseEnvironment
 from xtuner.v1.utils import get_logger
 
 
-@ray.remote
+@ray.remote(max_concurrency=int(os.environ.get("XTUNER_MAX_CONCURRENT", 4096)))
 class SingleTurnEnvironment(BaseEnvironment):
     """A single-turn environment for handling generation and evaluation tasks.
 

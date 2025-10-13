@@ -18,6 +18,7 @@ from xtuner.v1.ray import find_master_addr_and_port
 from xtuner.v1.ray.accelerator import AutoAcceleratorWorkers, SingleAcceleratorWorker
 from xtuner.v1.ray.config import RolloutConfig
 from xtuner.v1.utils import get_logger
+from httpx._config import Limits
 
 
 class RolloutWorker(SingleAcceleratorWorker):
@@ -57,7 +58,8 @@ class RolloutWorker(SingleAcceleratorWorker):
         self.server_func: Callable
         self.endpoints: dict[str, str] = dict()
         # handle stream response
-        self.client = httpx.AsyncClient(timeout=self.config.rollout_timeout)
+        limits = Limits(max_connections=int(os.environ.get("XTUNER_MAX_CONCURRENT", 4096)), max_keepalive_connections=20)
+        self.client = httpx.AsyncClient(timeout=self.config.rollout_timeout, limits=limits)
         self.paused = False
         self.server_task = None
         self.engine_bundle_idxs: list[int] = []

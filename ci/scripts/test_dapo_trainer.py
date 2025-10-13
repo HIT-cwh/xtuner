@@ -91,7 +91,7 @@ def main(args):
         model_name=os.path.basename(args.model_path).lower(),
         tokenizer_path=args.model_path,
         rollout_cross_node_comm=False,
-        tensor_parallel_size=4,  # TODO： sglang 暂时写死
+        tensor_parallel_size=1,  # TODO： sglang 暂时写死
         expert_parallel_size=1,
         gpus_per_node=args.gpus_per_node,  # gpu: 8, npu: 16
         dtype="bfloat16",
