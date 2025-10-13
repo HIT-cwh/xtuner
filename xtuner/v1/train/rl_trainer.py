@@ -292,7 +292,7 @@ class RLTrainer:
                 )
             )
             ray.get(self._train_controller.offload.remote(target="optimizer"))
-            self._maybe_save_hf()
+            # self._maybe_save_hf()
             ray.get(self._rollout_env_controller.onload_weights.remote())
             ray.get(self._train_controller.update_weights.remote())
             self.logger.info("update weights done!!!")

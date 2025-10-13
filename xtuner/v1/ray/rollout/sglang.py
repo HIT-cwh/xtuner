@@ -145,7 +145,7 @@ class SGLangWorker(RolloutWorker):
         sglang_server_args.base_gpu_id = self.rank % self.config.gpus_per_node
         sglang_server_args.gpu_id_step = 1
         sglang_server_args.nnodes = max(1, self.config.tensor_parallel_size // self.config.gpus_per_node)
-        sglang_server_args.skip_server_warmup = True
+        sglang_server_args.skip_server_warmup = False
         sglang_server_args.tp_size = self.config.tensor_parallel_size
         sglang_server_args.mem_fraction_static = self.config.gpu_memory_utilization
         # note: 非共卡模式下无需设置,共卡模式下需要offload必须设置，否则显存释放不了
@@ -155,6 +155,14 @@ class SGLangWorker(RolloutWorker):
             sglang_server_args.node_rank = self.rank // self.config.gpus_per_node
         else:
             sglang_server_args.node_rank = 0
+        
+        # 我们与 verl sglang 的区别
+        # log level info vs error
+        # mem_fraction_static 0.7 vs 0.8
+        # mm_attention_backend None vs 'fa3'
+        # skip_server_warmup True vs False
+        # TP 1 vs 4
+        # breakpoint()
         return sglang_server_args
 
     def _transform_sample_params(self, sample_params: Dict):
