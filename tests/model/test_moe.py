@@ -48,7 +48,7 @@ class TestMoE:
             num_experts_per_tok=2,
             first_k_dense_replace=1,
             hidden_factor=1.0,
-            moe_intermediate_size=512,  # TODO: Restriction of triton grouped gemm, should be optimizer
+            moe_intermediate_size=192,  # TODO: Restriction of triton grouped gemm, should be optimizer
             router=router_config,
         )
         model = MoE(config=config).to(dtype).to(device)

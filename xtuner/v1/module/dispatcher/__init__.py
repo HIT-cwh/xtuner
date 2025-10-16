@@ -19,6 +19,7 @@ from .base import (
     PreDispatchResult,
 )
 from .torch_all2all import TorchAll2AllDispatcher
+from .moe_tp import MoETPDispatcher
 
 
 logger = get_logger()
@@ -30,12 +31,20 @@ def build_dispatcher(
     dispatcher: Literal["deepep", "all2all"] | None,
     n_routed_experts: int,
     ep_group: dist.ProcessGroup | None = None,
+    moe_tp_group: dist.ProcessGroup | None = None,
     training_dtype: Literal["bf16", "fp8"] = "bf16",
     generate_dtype: Literal["bf16", "fp8"] = "bf16",
 ) -> DispacherInterface:
     if ep_group is None or ep_group.size() == 1:
         if dispatcher is not None:
             logger.warning(f"{dispatcher} will not be used because the ep group is None.")
+        if moe_tp_group is not None and moe_tp_group.size() > 1:
+            return MoETPDispatcher(
+                n_routed_experts=n_routed_experts,
+                process_group=moe_tp_group,
+                training_dtype=training_dtype,
+                generate_dtype=generate_dtype,
+            )  # type: ignore[return-value]
         return NaiveDispatcher(
             n_routed_experts=n_routed_experts,
             process_group=ep_group,

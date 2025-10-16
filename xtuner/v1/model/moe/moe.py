@@ -86,6 +86,8 @@ class MoEConfig(TransformerConfig):
     hidden_factor: Annotated[float, Parameter(group="moe")] = 1.0
     moe_intermediate_size: Annotated[int, Parameter(group="moe")]
     ep_size: Annotated[int, Parameter(group="moe")] = 1
+    tp_size: Annotated[int, Parameter(group="moe")] = 1
+    moe_tp_size: Annotated[int, Parameter(help="MoE tensor parallel size")] = 1
     dispatcher: Annotated[Literal["deepep", "all2all"] | None, Parameter(group="moe")] = None
     router: GreedyRouterConfig | NoAuxRouterConfig
     balancing_loss_cfg: BalancingLossConfig | None = BalancingLossConfig()
@@ -111,6 +113,8 @@ class MoE(BaseModel):
 
     config: MoEConfig
     ep_mesh: DeviceMesh | None = None
+    tp_mesh: DeviceMesh | None = None
+    moe_tp_mesh: DeviceMesh | None = None
 
     def __init__(self, config: MoEConfig):
         super().__init__()
@@ -123,6 +127,15 @@ class MoE(BaseModel):
             )["ep"]
         else:
             self.ep_mesh = None
+        if config.moe_tp_size is not None and config.moe_tp_size > 1:
+            world_size = dist.get_world_size()
+            self.moe_tp_mesh = init_device_mesh(
+                DEVICE,
+                (world_size // config.moe_tp_size, config.moe_tp_size),
+                mesh_dim_names=("dp", "moe_tp"),
+            )["moe_tp"]
+        else:
+            self.moe_tp_mesh = None
         self.config = config
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -246,6 +259,7 @@ class MoE(BaseModel):
         seq_ctx: list[SequenceContext] | SequenceContext,
         loss_ctx: list[CELossContext] | CELossContext | None,
     ):
+        # dist.breakpoint()
         # TODO: caoweihan: Recover this assertion after the refactor of LossContext
         if isinstance(seq_ctx, SequenceContext):
             # assert isinstance(loss_ctx, (CELossContext, LossContext)) or loss_ctx is None, (
@@ -502,9 +516,12 @@ class MoE(BaseModel):
             if self.config.return_hidden_states:
                 output["hidden_states"].append(hidden_states)
 
+        # torch.distributed.breakpoint()
         hidden_states = self.norm(hidden_states)
 
         loss, logits = self.lm_head(hidden_states, loss_ctx)  # type: ignore
+        # print(loss)
+        # torch.distributed.breakpoint()
         output["loss"] = loss
         output["logits"] = logits
 
@@ -585,6 +602,7 @@ class MoE(BaseModel):
                     layer_idx=layer_idx,
                     dispatcher=config.dispatcher,
                     ep_mesh=self.ep_mesh,
+                    moe_tp_mesh=self.moe_tp_mesh,
                 )
         layers.__class__.__repr__ = module_dict_repr  # type: ignore[method-assign]
         return layers
@@ -744,19 +762,32 @@ class MoE(BaseModel):
         experts_fsdp_size = world_size // self.fsdp_config.ep_size
 
         if self.fsdp_config.hsdp_sharding_size is None:
-            model_mesh = init_device_mesh(
-                device,
-                (experts_fsdp_size, self.fsdp_config.ep_size),
-                mesh_dim_names=(f"{self.fsdp_config.mesh_prefix}.fsdp", f"{self.fsdp_config.mesh_prefix}.ep"),
-            )
-            if self.ep_mesh is not None:
-                assert torch.equal(self.ep_mesh.mesh, model_mesh[f"{self.fsdp_config.mesh_prefix}.ep"].mesh), (
-                    "FSDP enabled, it requires the `ep_size` of model config equals to the `ep_size` of FSDPConfig."
+            if self.fsdp_config.moe_tp_size > 1:
+                experts_fsdp_size = world_size // self.fsdp_config.moe_tp_size
+                self.ep_mesh = init_device_mesh(device, (world_size, 1), mesh_dim_names=("_", f"{self.fsdp_config.mesh_prefix}.ep"))[f"{self.fsdp_config.mesh_prefix}.ep"]
+                model_mesh = init_device_mesh(
+                    device,
+                    (experts_fsdp_size, self.fsdp_config.moe_tp_size),
+                    mesh_dim_names=(f"{self.fsdp_config.mesh_prefix}.fsdp", f"{self.fsdp_config.mesh_prefix}.moe_tp"),
                 )
-            self.ep_mesh = model_mesh[f"{self.fsdp_config.mesh_prefix}.ep"]
-            self.fsdp_mesh = model_mesh[f"{self.fsdp_config.mesh_prefix}.fsdp"]
+                self.moe_tp_mesh = model_mesh[f"{self.fsdp_config.mesh_prefix}.moe_tp"]
+                self.fsdp_mesh = model_mesh[f"{self.fsdp_config.mesh_prefix}.fsdp"]
+            else:
+                self.moe_tp_mesh = init_device_mesh(device, (world_size, 1), mesh_dim_names=("_", f"{self.fsdp_config.mesh_prefix}.moe_tp"))[f"{self.fsdp_config.mesh_prefix}.moe_tp"]
+                model_mesh = init_device_mesh(
+                    device,
+                    (experts_fsdp_size, self.fsdp_config.ep_size),
+                    mesh_dim_names=(f"{self.fsdp_config.mesh_prefix}.fsdp", f"{self.fsdp_config.mesh_prefix}.ep"),
+                )
+                if self.ep_mesh is not None:
+                    assert torch.equal(self.ep_mesh.mesh, model_mesh[f"{self.fsdp_config.mesh_prefix}.ep"].mesh), (
+                        "FSDP enabled, it requires the `ep_size` of model config equals to the `ep_size` of FSDPConfig."
+                    )
+                self.ep_mesh = model_mesh[f"{self.fsdp_config.mesh_prefix}.ep"]
+                self.fsdp_mesh = model_mesh[f"{self.fsdp_config.mesh_prefix}.fsdp"]
         else:
             assert self.fsdp_config.ep_size == 1, "Currently, HSDP requires expert parallel size to be 1"
+            assert self.fsdp_config.moe_tp_size == 1, "Currently, HSDP requires tensor parallel size to be 1"
             # We can not init ep_mesh and fsdp_mesh like this.
             # This will lead to "RuntimeError: Cannot create a submesh from a submesh."
             # in FSDPParam.shard_mesh, as fsdp_mesh is not the root mesh. The root mesh is model_mesh.
@@ -814,7 +845,7 @@ class MoE(BaseModel):
             if self.fsdp_config.torch_compile:
                 torch._dynamo.config.cache_size_limit = 256
                 if self.fsdp_config.compile_targets is None:
-                    if self.ep_mesh.size() > 1:
+                    if self.ep_mesh.size() > 1 or self.moe_tp_mesh.size() > 1:
                         # all_to_all_single_autograd in TorchAll2AllDispatcher.dispatch can not be compiled even if the fullgraph=False
                         # ref: https://github.com/pytorch/pytorch/issues/155205
                         # todo: decorate MoEDecoderLayer.forward with @torch.compile(fullgraph=False) when the bug is fixed

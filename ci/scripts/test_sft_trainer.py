@@ -20,6 +20,7 @@ from xtuner.v1.train.trainer import Trainer
 from xtuner.v1.utils.device import get_device
 from xtuner.v1.loss import CELossConfig
 import argparse
+from xtuner.v1.float8.config import Float8Config, ScalingGranularity
 
 
 
@@ -218,16 +219,41 @@ def main():
     os.environ["DG_CACHE_DIR"] = f"/tmp/.adaptive_gemm-{os.getenv('RANK', '0')}"
 
     moe_cfgs = [
-        (Qwen3MoE30BA3Config(balancing_loss_cfg=BalancingLossConfig()), "ep1"),
-        (Qwen3MoE30BA3Config(ep_size=8, dispatcher="all2all"), "ep8"),
+        # (Qwen3MoE30BA3Config(balancing_loss_cfg=BalancingLossConfig()), "ep1"),
+        # (Qwen3MoE30BA3Config(ep_size=4, dispatcher="all2all"), "ep4"),
+        # (Qwen3MoE30BA3Config(
+        #     balancing_loss_cfg=BalancingLossConfig(), 
+        #     moe_tp_size=4, 
+        #     n_routed_experts=256,
+        #     moe_intermediate_size=2048,
+        #     hidden_size=7168,
+        #     num_hidden_layers=1,
+        # ), "tp4"),
+        # (Qwen3MoE30BA3Config(balancing_loss_cfg=BalancingLossConfig(), moe_tp_size=4), "tp4"),
+        (Qwen3MoE30BA3Config(
+            balancing_loss_cfg=BalancingLossConfig(), 
+            moe_tp_size=1, 
+            ep_size=1,
+            n_routed_experts=256,
+            moe_intermediate_size=2048,
+            hidden_size=7168,
+            num_hidden_layers=1,
+            float8_cfg=Float8Config(
+                scaling_granularity_gemm=ScalingGranularity.TILEWISE,
+                scaling_granularity_grouped_gemm=ScalingGranularity.TILEWISE,
+            ),
+
+        ), "tp1"),
     ]
     for moe_cfg, name in moe_cfgs:
-        optim_cfg = AdamWConfig(lr=6e-05)
+        optim_cfg = AdamWConfig(lr=6e-05, foreach=False)
         lr_cfg = LRConfig(lr_type="cosine", lr_min=1e-6)
         fsdp_cfg = FSDPConfig(
             torch_compile=False, #get_device() == "cuda",
             cpu_offload=False,
             ep_size=moe_cfg.ep_size,
+            tp_size=moe_cfg.tp_size,
+            moe_tp_size=moe_cfg.moe_tp_size,
             # hsdp_sharding_size=4,
         )
         dataset_config = [
@@ -239,12 +265,12 @@ def main():
         ]
 
         dataloader_config = DataloaderConfig(
-            pack_max_length=16384
+            pack_max_length=64*1024
         )
         work_dir = f"{args.work_dir}-{name}"
-        loss_cfg = CELossConfig(mode="chunk", chunk_size=1024, ignore_idx=-100)
+        loss_cfg = CELossConfig(mode="liger", chunk_size=1024, ignore_idx=-100)
         trainer = Trainer(
-            load_from=QWEN3_MOE_PATH,
+            # load_from=QWEN3_MOE_PATH,
             model_cfg=moe_cfg,
             optim_cfg=optim_cfg,
             fsdp_cfg=fsdp_cfg,
@@ -253,10 +279,13 @@ def main():
             loss_cfg=loss_cfg,
             lr_cfg=lr_cfg,
             tokenizer_path=QWEN3_MOE_PATH,
-            global_batch_size=16,
+            global_batch_size=8,
             total_epoch=1,
             work_dir=work_dir,
             seed=0,
+            profile_memory=True,
+            profile_step=[8],
+            intra_layer_micro_batch=1,
         )
         trainer.fit()
         if dist.get_rank() == 0:

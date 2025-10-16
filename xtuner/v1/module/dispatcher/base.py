@@ -335,3 +335,93 @@ class NaiveDispatcher(
             raise NotImplementedError("Naive dispatcher is only for ep=1.")
 
         return PostCombineResult(hidden_states=combined["hidden_states"])
+
+
+from torch.distributed._functional_collectives import (
+    all_gather_tensor_autograd, 
+    reduce_scatter_tensor_autograd, 
+    AsyncCollectiveTensor,
+    all_gather_tensor,)
+
+class NaiveMoETPDispatcher(NaiveDispatcher):
+
+    def __init__(
+        self,
+        *,
+        n_routed_experts: int,
+        process_group: torch.distributed.ProcessGroup | None = None,
+        moe_tp_process_group: torch.distributed.ProcessGroup | None = None,
+        training_dtype: Literal["fp8", "bf16"] = "bf16",
+        generate_dtype: Literal["fp8", "bf16"] = "bf16",
+    ):
+        super().__init__(
+            n_routed_experts=n_routed_experts,
+            process_group=process_group,
+            training_dtype=training_dtype,
+            generate_dtype=generate_dtype,
+        )
+        if self._process_group is not None:
+            assert self._process_group.size() == 1, "Naive dispatcher is only for ep=1."
+        self.moe_tp_process_group = moe_tp_process_group
+    
+    @override
+    def dispatch(
+        self,
+        *,
+        pre_dispatched: PreDispatchResult,
+        topk_weights: torch.Tensor,
+        async_op: bool = False,
+        decoding: bool = False,
+    ) -> NaiveDispatchResult:
+        if async_op:
+            raise NotImplementedError("Naive dispatcher is only for ep=1.")
+        
+        hidden_states = pre_dispatched["hidden_states"]
+        topk_ids = pre_dispatched["topk_ids"]
+        hidden_states = all_gather_tensor_autograd(hidden_states, gather_dim=0, group=self.moe_tp_process_group)
+        if isinstance(hidden_states, AsyncCollectiveTensor):
+            hidden_states = hidden_states.wait()
+        topk_ids = all_gather_tensor(topk_ids, gather_dim=0, group=self.moe_tp_process_group)
+        if isinstance(topk_ids, AsyncCollectiveTensor):
+            topk_ids = topk_ids.wait()
+
+        return NaiveDispatchResult(
+            hidden_states=pre_dispatched["hidden_states"],
+            topk_weights=topk_weights,
+        )
+
+    @override
+    def dispatch_postprocess(
+        self,
+        *,
+        pre_dispatched: NaivePreDispatchResult,
+        dispatched: NaiveDispatchResult,
+        async_op: bool = False,
+        decoding: bool = False,
+    ) -> NaivePostDispatchResult:
+        if async_op:
+            raise NotImplementedError("Naive dispatcher is only for ep=1.")
+        
+        hidden_states = pre_dispatched["hidden_states"]
+        topk_ids = pre_dispatched["topk_ids"]
+        torch.distributed.breakpoint()
+        hidden_states = all_gather_tensor_autograd(hidden_states, gather_dim=0, group=self.moe_tp_process_group)
+        if isinstance(hidden_states, AsyncCollectiveTensor):
+            hidden_states = hidden_states.wait()
+        topk_ids = all_gather_tensor(topk_ids, gather_dim=0, group=self.moe_tp_process_group)
+        if isinstance(topk_ids, AsyncCollectiveTensor):
+            topk_ids = topk_ids.wait()
+        
+        hidden_states, row_id_maps = permute(
+            hidden_states,
+            topk_ids.to(torch.int32),
+        )
+        tokens_per_expert = torch.histc(topk_ids, bins=self._n_routed_experts, min=0, max=self._n_routed_experts)
+        if decoding:
+            raise NotImplementedError
+        else:
+            return NaivePostDispatchResult(
+                hidden_states=hidden_states,
+                row_ids_map=row_id_maps,
+                tokens_per_expert=tokens_per_expert,
+            )

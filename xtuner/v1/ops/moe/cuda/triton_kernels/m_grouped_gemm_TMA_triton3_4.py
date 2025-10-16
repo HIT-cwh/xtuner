@@ -1,5 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import Optional
+from typing import Optional, List
 
 import torch
 import triton
@@ -10,21 +10,112 @@ from torch import Tensor
 # from .utils import TmaAutoTuneHelper
 
 
-def get_cuda_autotune_config():
+def get_cuda_autotune_config(K: int) -> List[triton.Config]:
+    if K<=32:
+         base_configs = [
+            (64, 16, 6, 3, 8),
+            (256, 16, 6, 3, 8),
+            (64, 16, 8, 3, 8),
+            (256, 16, 8, 3, 8),
+            (64, 16, 10, 3, 8),
+            (256, 16, 10, 3, 8),
+            (64, 16, 14, 3, 8),
+            (256, 16, 14, 3, 8),
+            (64, 16, 18, 3, 8),
+            (256, 16, 18, 3, 8),
+            (64, 16, 22, 3, 8),
+            (256, 16, 22, 3, 8), 
+        ]
+    elif K<=64:
+         base_configs = [
+            (64, 32, 6, 3, 8),
+            (256, 32, 6, 3, 8),
+            (64, 32, 8, 3, 8),
+            (256, 32, 8, 3, 8),
+            (64, 32, 10, 3, 8),
+            (256, 32, 10, 3, 8),
+            (64, 32, 14, 3, 8),
+            (256, 32, 14, 3, 8),
+            (64, 32, 18, 3, 8),
+            (256, 32, 18, 3, 8),
+            (64, 32, 22, 3, 8),
+            (256, 32, 22, 3, 8), 
+        ]
+    elif K<=128:
+        base_configs = [
+            (64, 64, 6, 3, 8),
+            (256, 64, 6, 3, 8),
+            (64, 64, 8, 3, 8),
+            (256, 64, 8, 3, 8),
+            (64, 64, 10, 3, 8),
+            (256, 64, 10, 3, 8),
+            (64, 64, 14, 3, 8),
+            (256, 64, 14, 3, 8),
+            (64, 64, 18, 3, 8),
+            (256, 64, 18, 3, 8),
+            (64, 64, 22, 3, 8),
+            (256, 64, 22, 3, 8),
+            
+        ]
+    elif K<=256:
+        base_configs = [
+            (64, 128, 6, 3, 8),
+            (256, 64, 6, 3, 8),
+            (64, 128, 8, 3, 8),
+            (256, 64, 8, 3, 8),
+            (64, 128, 10, 3, 8),
+            (256, 64, 10, 3, 8),
+            (64, 128, 14, 3, 8),
+            (256, 64, 14, 3, 8),
+            (64, 128, 18, 3, 8),
+            (256, 64, 18, 3, 8),
+            (64, 128, 22, 3, 8),
+            (256, 64, 22, 3, 8),
+            
+        ]
+    else:
+        base_configs = [
+            (64, 256, 6, 3, 8),
+            (256, 64, 6, 3, 8),
+            (64, 256, 8, 3, 8),
+            (256, 64, 8, 3, 8),
+            (64, 256, 10, 3, 8),
+            (256, 64, 10, 3, 8),
+            (64, 256, 14, 3, 8),
+            (256, 64, 14, 3, 8),
+            (64, 256, 18, 3, 8),
+            (256, 64, 18, 3, 8),
+            (64, 256, 22, 3, 8),
+            (256, 64, 22, 3, 8),
+        ]
+    
     return [
-        triton.Config({"BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 6}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 6}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 8}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 8}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 10}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 10}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 14}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 14}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 18}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 18}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 22}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 22}, num_stages=3, num_warps=8),
+        triton.Config(
+            {"BLOCK_N": block_n, "BLOCK_K": block_k, "GROUP_M": group_m},
+            num_stages=stages, 
+            num_warps=warps
+        )
+        for block_n, block_k, group_m, stages, warps in base_configs
     ]
+def conditional_autotune(k1, k2, k3,k4, key):
+    def decorator(func):
+        k_32= triton.autotune(configs=k1, key=key)(triton.jit(func))
+        k_64 = triton.autotune(configs=k2, key=key)(triton.jit(func))
+        k_128= triton.autotune(configs=k3, key=key)(triton.jit(func))
+        k_256 = triton.autotune(configs=k4, key=key)(triton.jit(func))
+        
+        def kernel_selector(K):
+            if K == 32 :
+                return k_32
+            elif K==64:
+                return k_64
+            elif K==128:
+                return k_128
+            else:
+                return k_256
+        
+        return kernel_selector
+    return decorator
 
 
 @triton.jit
@@ -43,8 +134,14 @@ def grouped_launch(pid, m, n, block_m: tl.constexpr, block_n: tl.constexpr, grou
     return pid_m, pid_n
 
 
-@triton.autotune(configs=get_cuda_autotune_config(), key=["N", "K"])
-@triton.jit
+            
+@conditional_autotune(
+    k1=get_cuda_autotune_config(32),
+    k2=get_cuda_autotune_config(64),
+    k3=get_cuda_autotune_config(128),
+    k4=get_cuda_autotune_config(256),
+    key=["N", "K"]
+)       
 def m_grouped_gemm_bKmajor_kernel(
     A,
     B,
@@ -82,8 +179,8 @@ def m_grouped_gemm_bKmajor_kernel(
     for tile_id in tl.range(start_pid, num_tiles, BLOCKS):
         pid_m, pid_n = grouped_launch(tile_id, M_pad, N, BLOCK_M, BLOCK_N, GROUP_M)
 
-        group = tl.load(m_indices_pad + pid_m)
-        pad_off = tl.load(pad_starts + group)
+        group = tl.load(m_indices_pad + pid_m).to(tl.int32)
+        pad_off = tl.load(pad_starts + group).to(tl.int32)
 
         group_start = (tl.load(group_starts + group) + (pid_m * BLOCK_M - pad_off)).to(tl.int32)
         group_end = tl.load(group_ends + group).to(tl.int32)
@@ -92,48 +189,59 @@ def m_grouped_gemm_bKmajor_kernel(
         offs_bn = (pid_n * BLOCK_N).to(tl.int32)
         offs_k = 0
 
-        a_ptr = (A + group_start * K).to(tl.pointer_type(dtypeA))
-        b_ptr = (B + group * N * K).to(tl.pointer_type(dtypeB))
-        c_ptr = (C + group_start * N).to(tl.pointer_type(dtypeC))
+        
+        a_ptr = (A ).to(tl.pointer_type(dtypeA))
+        b_ptr = (B ).to(tl.pointer_type(dtypeB))
+        c_ptr = (C).to(tl.pointer_type(dtypeC))
 
+
+        
+        
         a_desc = tl.make_tensor_descriptor(
             a_ptr,
-            shape=[(group_end - group_start), K],
+            shape=[(group_end - 0), K],
             strides=[K, 1],
             block_shape=[BLOCK_M, BLOCK_K],
         )
 
         b_desc = tl.make_tensor_descriptor(
             b_ptr,
-            shape=[N, K],
+            shape=[(group + 1) * N, K],
             strides=[K, 1],
             block_shape=[BLOCK_N, BLOCK_K],
         )
         c_desc = tl.make_tensor_descriptor(
             c_ptr,
-            shape=[(group_end - group_start), N],
+            shape=[(group_end - 0), N],
             strides=[N, 1],
             block_shape=[BLOCK_M, BLOCK_N],
         )
 
         accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         for k in tl.range(0, tl.cdiv(K, BLOCK_K)):
-            a = a_desc.load([offs_am, offs_k])
-            b = b_desc.load([offs_bn, offs_k])
+            a = a_desc.load([group_start + offs_am, offs_k])
+            b = b_desc.load([group * N + offs_bn, offs_k])
 
             # mma
             accumulator = tl.dot(a, b.T, acc=accumulator, input_precision="tf32x3")
             offs_k += BLOCK_K
 
         c = accumulator.to(dtypeC)
-        # offs_cm = group_start
-        offs_cm = 0
+        offs_cm = group_start
+        # offs_cm = 0
         offs_cn = (pid_n * BLOCK_N).to(tl.int32)
         c_desc.store([offs_cm, offs_cn], c)
 
 
-@triton.autotune(configs=get_cuda_autotune_config(), key=["N", "K"])
-@triton.jit
+
+
+@conditional_autotune(
+    k1=get_cuda_autotune_config(32),
+    k2=get_cuda_autotune_config(64),
+    k3=get_cuda_autotune_config(128),
+    k4=get_cuda_autotune_config(256),
+    key=["N", "K"]
+)   
 def m_grouped_gemm_bNmajor_kernel(
     A,
     B,
@@ -172,43 +280,43 @@ def m_grouped_gemm_bNmajor_kernel(
         pid_m, pid_n = grouped_launch(tile_id, M_pad, N, BLOCK_M, BLOCK_N, GROUP_M)
 
         group = tl.load(m_indices_pad + pid_m)
-        pad_off = tl.load(pad_starts + group)
+        pad_off = tl.load(pad_starts + group).to(tl.int32)
 
         group_start = (tl.load(group_starts + group) + (pid_m * BLOCK_M - pad_off)).to(tl.int32)
-        group_end = tl.load(group_ends + group)
+        group_end = tl.load(group_ends + group).to(tl.int32)
+        b_group_ptr = (B + group * K * N).to(tl.pointer_type(dtypeB))
 
         offs_am = 0
         offs_bn = (pid_n * BLOCK_N).to(tl.int32)
         offs_k = 0
         offs_bk = 0
-
-        a_ptr = (A + group_start * K).to(tl.pointer_type(dtypeA))
-        b_ptr = (B + group * K * N).to(tl.pointer_type(dtypeB))
-        c_ptr = (C + group_start * N).to(tl.pointer_type(dtypeC))
+        a_ptr = (A ).to(tl.pointer_type(dtypeA))
+        b_ptr = (B ).to(tl.pointer_type(dtypeB))
+        c_ptr = (C).to(tl.pointer_type(dtypeC))
 
         a_desc = tl.make_tensor_descriptor(
             a_ptr,
-            shape=[(group_end - group_start), K],
+            shape=[(group_end - 0), K],
             strides=[K, 1],
             block_shape=[BLOCK_M, BLOCK_K],
         )
 
         b_desc = tl.make_tensor_descriptor(
-            b_ptr,
+            b_group_ptr,
             shape=[K, N],
             strides=[N, 1],
             block_shape=[BLOCK_K, BLOCK_N],
         )
         c_desc = tl.make_tensor_descriptor(
             c_ptr,
-            shape=[(group_end - group_start), N],
+            shape=[(group_end - 0), N],
             strides=[N, 1],
             block_shape=[BLOCK_M, BLOCK_N],
         )
 
         accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         for k in tl.range(0, tl.cdiv(K, BLOCK_K)):
-            a = a_desc.load([offs_am, offs_k])
+            a = a_desc.load([group_start+offs_am, offs_k])
             b = b_desc.load([offs_bk, offs_bn])
             # mma
             accumulator = tl.dot(a, b, acc=accumulator, input_precision="tf32x3")
@@ -216,9 +324,12 @@ def m_grouped_gemm_bNmajor_kernel(
             offs_bk += BLOCK_K
 
         c = accumulator.to(dtypeC)
-        offs_cm = 0
+        # offs_cm = 0
+        offs_cm = group_start
+
         offs_cn = (pid_n * BLOCK_N).to(tl.int32)
         c_desc.store([offs_cm, offs_cn], c)
+
 
 
 @triton.jit
@@ -274,7 +385,7 @@ def m_grouped_gemm(
     M_pad = m_per_group_padding.sum()
 
     repeats = (m_per_group_padding // BLOCK_M).to(torch.int32)
-    m_indices_pad = torch.empty(M // BLOCK_M + num_groups, device=size_per_group.device, dtype=torch.int64)
+    m_indices_pad = torch.empty(M_pad // BLOCK_M, device=size_per_group.device, dtype=torch.int64)
     repeat_interleave(
         torch.arange(num_groups, device="cuda").to(torch.int32), repeats, repeats.cumsum(0), m_indices_pad
     )
@@ -291,6 +402,7 @@ def m_grouped_gemm(
     dtype_a = dtype_mapping.get(A.dtype, -1)
     dtype_b = dtype_mapping.get(B.dtype, -1)
     dtype_c = dtype_mapping.get(C.dtype, -1)
+    # breakpoint()
 
     def grid(META):
         # assert N % META["BLOCK_N"] == 0, "Only support when N is a multiple of BLOCK_N"
@@ -302,9 +414,7 @@ def m_grouped_gemm(
         return torch.empty(size, device="cuda", dtype=torch.int8)
 
     triton.set_allocator(alloc_fn)
-
-    m_grouped_gemm_kernel = m_grouped_gemm_bKmajor_kernel if trans_b else m_grouped_gemm_bNmajor_kernel
-
+    m_grouped_gemm_kernel = m_grouped_gemm_bKmajor_kernel(K) if trans_b else m_grouped_gemm_bNmajor_kernel(K)
     m_grouped_gemm_kernel[grid](
         A,
         B,
