@@ -126,7 +126,7 @@ class Float8Handler:
 
         self.fsdp_mesh = fsdp_mesh
         if self.is_tilewise_fp8:
-            # self._build_reduce_mesh_devided_64(fsdp_mesh)
+            self._build_reduce_mesh_devided_64(fsdp_mesh)
             self._build_reduce_mesh_mapping(model, fsdp_mesh)
 
     def _build_reduce_mesh_devided_64(self, fsdp_mesh: DeviceMesh):

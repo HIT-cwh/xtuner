@@ -162,7 +162,7 @@ def build_grouped_linear(
 ):
     """Build a grouped linear layer with optional float8 support."""
     if float8_cfg is None:
-        if moe_tp_mesh is None:
+        if moe_tp_mesh is None or moe_tp_mesh.size() == 1:
             tp = None
         if tp is None:
             return GroupedLinear(in_features, out_features, num_routed_experts, moe_bias=moe_bias, ep_mesh=ep_mesh)
@@ -173,7 +173,7 @@ def build_grouped_linear(
         else:
             raise ValueError(f"Unsupported tp: {tp}")
     elif float8_cfg.scaling_granularity_grouped_gemm == ScalingGranularity.TILEWISE:
-        if moe_tp_mesh is None:
+        if moe_tp_mesh is None or moe_tp_mesh.size() == 1:
             tp = None
         if tp is None:
             return TileWiseFloat8GroupedLinear(

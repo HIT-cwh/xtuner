@@ -260,6 +260,7 @@ class MoE(BaseModel):
         loss_ctx: list[CELossContext] | CELossContext | None,
     ):
         # dist.breakpoint()
+        dist.barrier()
         # TODO: caoweihan: Recover this assertion after the refactor of LossContext
         if isinstance(seq_ctx, SequenceContext):
             # assert isinstance(loss_ctx, (CELossContext, LossContext)) or loss_ctx is None, (

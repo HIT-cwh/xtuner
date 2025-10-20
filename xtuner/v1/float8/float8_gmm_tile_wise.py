@@ -19,7 +19,11 @@ from xtuner.v1.float8.triton_kernels import (
     trans_per_tile_quant_expand_128x,
 )
 
-
+try:
+    import deep_gemm
+    deep_gemm.set_num_sms(132 - 16)
+except ImportError:
+    deep_gemm = None
 # from xtuner.v1.module.grouped_linear.moe_group_linear import GroupedLinear
 
 
@@ -83,7 +87,7 @@ class weight_to_per_block_float8_dynamic(torch.autograd.Function):
         return g, None, None
 
 
-class fp8_gmm_weight_per_block_act_per_tile(torch.autograd.Function):
+class fp8_gmm_weight_per_block_act_per_tile1(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w_fp8, tokens_per_expert):
         seq, din = x.shape
@@ -142,63 +146,116 @@ class fp8_gmm_weight_per_block_act_per_tile(torch.autograd.Function):
     
 
 from xtuner.v1.ops.moe.cuda.triton_kernels import k_grouped_gemm
-class fp8_gmm_weight_per_block_act_per_tile1(torch.autograd.Function):
+from torch import Tensor
+import triton
+import triton.language as tl
+
+
+@torch.library.custom_op("moe::deepgemm_new_fwd", mutates_args=('out', ))
+def deepgemm_new_fwd(
+        lhs: torch.Tensor, 
+        lhs_scales: torch.Tensor, 
+        rhs: torch.Tensor, 
+        rhs_scales: torch.Tensor, 
+        out: torch.Tensor, 
+        indices: torch.Tensor,
+) -> None:
+    deep_gemm.m_grouped_fp8_gemm_nt_contiguous((lhs, lhs_scales), (rhs, rhs_scales), out, indices, disable_ue8m0_cast=True)
+
+
+@deepgemm_new_fwd.register_fake
+def _(
+        lhs: torch.Tensor, 
+        lhs_scales: torch.Tensor, 
+        rhs: torch.Tensor, 
+        rhs_scales: torch.Tensor, 
+        out: torch.Tensor, 
+        indices: torch.Tensor,
+) -> None:
+    return
+
+
+@triton.jit
+def repeat_interleave_kernel(
+    group_ptr,
+    repeats_ptr,
+    repeat_cum_ptr,
+    output_ptr,
+    # BLOCK_M: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    repeat = tl.load(repeats_ptr + pid)
+    start = tl.load(repeat_cum_ptr + pid) - repeat
+    group = tl.load(group_ptr + pid)
+
+    for r in range(repeat):
+        tl.store(output_ptr + start + r, group)
+
+
+@torch.library.custom_op("moe::repeat_interleave", mutates_args=('m_indices_pad', ))
+def repeat_interleave(
+    group_indices: Tensor, 
+    repeats: Tensor, 
+    repeat_cum: Tensor, 
+    m_indices_pad: Tensor, 
+) -> None:
+    grid = lambda args: (len(repeats), )
+    repeat_interleave_kernel[grid](group_indices, repeats, repeat_cum, m_indices_pad)
+    return
+
+
+@repeat_interleave.register_fake
+def _(
+    group_indices: Tensor, 
+    repeats: Tensor, 
+    repeat_cum: Tensor, 
+    m_indices_pad: Tensor, 
+) -> None:
+    return
+
+
+class fp8_gmm_weight_per_block_act_per_tile(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w_fp8, tokens_per_expert):
         seq, din = x.shape
         ne, dout, din = w_fp8.shape
         x_fp8, x_scale = per_tile_quant(x)
-        # (
-        #     x_trans_quant_fp8,
-        #     x_trans_quant_scale,
-        #     _,
-        # ) = trans_per_block_quant_expand_128x(x, tokens_per_expert, group_size=128, dtype=torch.float8_e4m3fn)
 
-        out = m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(
-            (x_fp8, x_scale), (w_fp8._data, w_fp8._scale), tokens_per_expert
+        indices = torch.empty(seq, device=x.device, dtype=torch.int32)
+        group_indices = torch.arange(ne, device=x.device).int()
+        tokens_per_expert_cum = tokens_per_expert.cumsum(0)
+        repeat_interleave(group_indices, tokens_per_expert, tokens_per_expert_cum, indices)
+        out = x.new_empty((seq, dout))
+        deepgemm_new_fwd(
+            x_fp8, x_scale, w_fp8._data, w_fp8._scale, out, indices
         )
 
-        ctx.save_for_backward(x, w_fp8, tokens_per_expert)
+        ctx.save_for_backward(x, w_fp8, tokens_per_expert, indices)
         return out
 
     @staticmethod
     def backward(ctx, grad_output_hp):
         (
-            # x_trans_quant_fp8,
-            # x_trans_quant_scale,
             x,
             w_fp8,
             tokens_per_expert,
+            indices,
         ) = ctx.saved_tensors
 
         ne, dout, din = w_fp8.shape
         seq, dout = grad_output_hp.shape
         grad_out_fp8, grad_out_scale = per_tile_quant(grad_output_hp)
-        dx = m_grouped_varlen_gemm_fp8_fp8_bf16_nt_contiguous(
-            (grad_out_fp8, grad_out_scale),
-            (
-                w_fp8._data.transpose(1, 2).contiguous(),
-                w_fp8._scale.transpose(1, 2).contiguous(),
-            ),
-            tokens_per_expert,
+        dx = grad_output_hp.new_empty((seq, din))
+        deepgemm_new_fwd(
+            grad_out_fp8, 
+            grad_out_scale,
+            w_fp8._data.transpose(1, 2).contiguous(),
+            w_fp8._scale.transpose(1, 2).contiguous(),
+            dx, 
+            indices,
         )
 
         dw = k_grouped_gemm(grad_output_hp, x, tokens_per_expert)
-        # torch.distributed.breakpoint()
-        # (
-        #     grad_out_trans_fp8,
-        #     grad_out_trans_scale,
-        #     tokens_per_expert_expand,
-        # ) = trans_per_tile_quant_expand_128x(grad_output_hp, tokens_per_expert)
-        # dw = grad_output_hp.new_empty((ne, dout, din))
-        # k_grouped_gemm_dw_fp8_fp8_bf16_tn_contiguous(
-        #     grad_out_trans_fp8,
-        #     grad_out_trans_scale,
-        #     x_trans_quant_fp8,
-        #     x_trans_quant_scale,
-        #     dw,
-        #     tokens_per_expert_expand.int(),
-        # )
 
         return dx, dw, None
 
