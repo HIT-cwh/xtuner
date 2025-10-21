@@ -479,6 +479,12 @@ class Trainer:
                         loss_ctx=loss_ctx,
                     )
                 )
+            
+            torch.cuda.synchronize()
+            tensor_in = torch.arange(1, dtype=torch.int32, device='cuda')
+            dist.all_reduce(tensor_in, op=dist.ReduceOp.SUM)
+            torch.cuda.synchronize()
+            time_before_train_step = time.time()
 
             with self._maybe_profiling():
                 loss_log, other_log = self._engine.train_step(engine_input)

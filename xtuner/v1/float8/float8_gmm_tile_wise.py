@@ -87,7 +87,7 @@ class weight_to_per_block_float8_dynamic(torch.autograd.Function):
         return g, None, None
 
 
-class fp8_gmm_weight_per_block_act_per_tile1(torch.autograd.Function):
+class fp8_gmm_weight_per_block_act_per_tile(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w_fp8, tokens_per_expert):
         seq, din = x.shape
@@ -214,7 +214,7 @@ def _(
     return
 
 
-class fp8_gmm_weight_per_block_act_per_tile(torch.autograd.Function):
+class fp8_gmm_weight_per_block_act_per_tile1(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w_fp8, tokens_per_expert):
         seq, din = x.shape
@@ -556,7 +556,7 @@ class TileWiseFloat8GroupedColumnLinear(torch.nn.Module):
 
         orig_shape = input.shape
         input = input.view(-1, input.shape[-1])
-        out = fp8_gmm_weight_per_block_act_per_tile.apply(input, weight_fp8, tokens_per_expert)
+        out = fp8_gmm_weight_per_block_act_per_tile1.apply(input, weight_fp8, tokens_per_expert)
         out = out.view(*orig_shape[:-1], -1)
         return out
 
@@ -698,7 +698,7 @@ class TileWiseFloat8GroupedRowLinear(torch.nn.Module):
 
         orig_shape = input.shape
         input = input.view(-1, input.shape[-1])
-        out = fp8_gmm_weight_per_block_act_per_tile.apply(input, weight_fp8, tokens_per_expert)
+        out = fp8_gmm_weight_per_block_act_per_tile1.apply(input, weight_fp8, tokens_per_expert)
         out = out.view(*orig_shape[:-1], -1)
         return out
 

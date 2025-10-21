@@ -268,7 +268,7 @@ def main():
     ]
     for moe_cfg, name in moe_cfgs:
 
-        optim_cfg = AdamWConfig(lr=6e-05, foreach=False)
+        optim_cfg = AdamWConfig(lr=6e-05)
         lr_cfg = LRConfig(lr_type="cosine", lr_min=1e-6)
         fsdp_cfg = FSDPConfig(
             torch_compile=True, #get_device() == "cuda",
@@ -302,7 +302,7 @@ def main():
             loss_cfg=loss_cfg,
             lr_cfg=lr_cfg,
             tokenizer_path=QWEN3_MOE_PATH,
-            global_batch_size=n_gpus * intra_layer_micro_batch,
+            global_batch_size=n_gpus * intra_layer_micro_batch * 2,
             total_epoch=100,
             work_dir=work_dir,
             seed=0,
