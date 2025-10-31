@@ -2,6 +2,7 @@
 
 import math
 from typing import Optional, Tuple
+import os
 
 import torch
 import torch.nn as nn
@@ -19,7 +20,12 @@ from xtuner.v1.float8.triton_kernels import (
     trans_per_tile_quant_expand_128x,
 )
 
-
+try:
+    import deep_gemm
+    MinusSM = int(os.environ.get("MinusSM", 0))
+    deep_gemm.set_num_sms(132 - MinusSM)
+except ImportError:
+    deep_gemm = None
 # from xtuner.v1.module.grouped_linear.moe_group_linear import GroupedLinear
 
 
@@ -137,6 +143,121 @@ class fp8_gmm_weight_per_block_act_per_tile(torch.autograd.Function):
             dw,
             tokens_per_expert_expand.int(),
         )
+
+        return dx, dw, None
+    
+
+from xtuner.v1.ops.moe.cuda.triton_kernels import k_grouped_gemm
+from torch import Tensor
+import triton
+import triton.language as tl
+
+
+@torch.library.custom_op("moe::deepgemm_new_fwd", mutates_args=('out', ))
+def deepgemm_new_fwd(
+        lhs: torch.Tensor, 
+        lhs_scales: torch.Tensor, 
+        rhs: torch.Tensor, 
+        rhs_scales: torch.Tensor, 
+        out: torch.Tensor, 
+        indices: torch.Tensor,
+) -> None:
+    deep_gemm.m_grouped_fp8_gemm_nt_contiguous((lhs, lhs_scales), (rhs, rhs_scales), out, indices, disable_ue8m0_cast=True)
+
+
+@deepgemm_new_fwd.register_fake
+def _(
+        lhs: torch.Tensor, 
+        lhs_scales: torch.Tensor, 
+        rhs: torch.Tensor, 
+        rhs_scales: torch.Tensor, 
+        out: torch.Tensor, 
+        indices: torch.Tensor,
+) -> None:
+    return
+
+
+@triton.jit
+def repeat_interleave_kernel(
+    group_ptr,
+    repeats_ptr,
+    repeat_cum_ptr,
+    output_ptr,
+    # BLOCK_M: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    repeat = tl.load(repeats_ptr + pid)
+    start = tl.load(repeat_cum_ptr + pid) - repeat
+    group = tl.load(group_ptr + pid)
+
+    for r in range(repeat):
+        tl.store(output_ptr + start + r, group)
+
+
+@torch.library.custom_op("moe::repeat_interleave", mutates_args=('m_indices_pad', ))
+def repeat_interleave(
+    group_indices: Tensor, 
+    repeats: Tensor, 
+    repeat_cum: Tensor, 
+    m_indices_pad: Tensor, 
+) -> None:
+    grid = lambda args: (len(repeats), )
+    repeat_interleave_kernel[grid](group_indices, repeats, repeat_cum, m_indices_pad)
+    return
+
+
+@repeat_interleave.register_fake
+def _(
+    group_indices: Tensor, 
+    repeats: Tensor, 
+    repeat_cum: Tensor, 
+    m_indices_pad: Tensor, 
+) -> None:
+    return
+
+
+class fp8_gmm_weight_per_block_act_per_tile1(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, w_fp8, tokens_per_expert):
+        seq, din = x.shape
+        ne, dout, din = w_fp8.shape
+        x_fp8, x_scale = per_tile_quant(x)
+
+        indices = torch.empty(seq, device=x.device, dtype=torch.int32)
+        group_indices = torch.arange(ne, device=x.device).int()
+        tokens_per_expert_cum = tokens_per_expert.cumsum(0)
+        repeat_interleave(group_indices, tokens_per_expert, tokens_per_expert_cum, indices)
+        out = x.new_empty((seq, dout))
+        deepgemm_new_fwd(
+            x_fp8, x_scale, w_fp8._data, w_fp8._scale, out, indices
+        )
+
+        ctx.save_for_backward(x, w_fp8, tokens_per_expert, indices)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output_hp):
+        (
+            x,
+            w_fp8,
+            tokens_per_expert,
+            indices,
+        ) = ctx.saved_tensors
+
+        ne, dout, din = w_fp8.shape
+        seq, dout = grad_output_hp.shape
+        grad_out_fp8, grad_out_scale = per_tile_quant(grad_output_hp)
+        dx = grad_output_hp.new_empty((seq, din))
+        deepgemm_new_fwd(
+            grad_out_fp8, 
+            grad_out_scale,
+            w_fp8._data.transpose(1, 2).contiguous(),
+            w_fp8._scale.transpose(1, 2).contiguous(),
+            dx, 
+            indices,
+        )
+
+        dw = k_grouped_gemm(grad_output_hp, x, tokens_per_expert)
 
         return dx, dw, None
 
@@ -296,6 +417,290 @@ class TileWiseFloat8GroupedLinear(torch.nn.Module):
         orig_shape = input.shape
         input = input.view(-1, input.shape[-1])
         out = fp8_gmm_weight_per_block_act_per_tile.apply(input, weight_fp8, tokens_per_expert)
+        out = out.view(*orig_shape[:-1], -1)
+        return out
+
+    @property
+    def is_padded(self) -> bool:
+        return self.pad_shape is not None
+
+    def pad_for_fsdp(self, padded_out_features: int) -> None:
+        """Pad the weight to make it compatible with fsdp."""
+        assert padded_out_features >= self.weight.shape[0], (
+            f"Expected padded_out_features {padded_out_features} >= self.weight.shape[0] {self.weight.shape[0]}."
+        )
+        assert padded_out_features % 128 == 0, (
+            f"padded_out_features {padded_out_features} must be divisible by 128 for tile-wise fp8."
+        )
+        assert self.in_features % 128 == 0, (
+            f"self.in_features {self.in_features} must be divisible by 128 for tile-wise fp8."
+        )
+        if padded_out_features == self.weight.shape[0]:
+            return
+        if isinstance(self.weight, DTensor):
+            assert padded_out_features == self.weight.shape[0], "Padding is not support for EP training."
+            return
+        weight = torch.empty(
+            (padded_out_features, self.in_features),
+            dtype=self.weight.dtype,
+            layout=self.weight.layout,
+            device=self.weight.device,
+        )
+        weight[: self.weight.shape[0]].data.copy_(self.weight.data)  # copy the original weight
+        weight[self.weight.shape[0] :].data.copy_(0.0)  # type: ignore  # zero pad the weight
+        weight = WeightWithDynamicTilewiseFloat8CastTensor(
+            weight,
+            torch.float8_e4m3fn,
+            (self.num_routed_experts * self.out_features, self.in_features),
+        )
+        self.register_parameter("weight", nn.Parameter(weight))
+        self.pad_shape = (padded_out_features, self.in_features)
+
+    def extra_repr(self) -> str:
+        out = (
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"num_routed_experts={self.num_routed_experts}"
+        )
+        if self.is_padded:
+            out += f", padded_out_features={self.pad_shape[0]}"  # type: ignore
+        return out
+    
+
+class TileWiseFloat8GroupedColumnLinear(torch.nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        num_routed_experts: int,
+        moe_bias: bool = False,
+        ep_mesh: DeviceMesh | None = None,
+        moe_tp_mesh: DeviceMesh | None = None,
+    ) -> None:
+        super().__init__()
+
+        assert moe_bias is False, "TileWiseFloat8GroupedLinear only supports moe_bias=False for now."
+
+        assert ADAPTIVEGEMM_INSTALLED, (
+            "Please install adaptive_gemm:"
+            "1. git clone --recursive git@github.com:InternLM/AdaptiveGEMM.git\n"
+            "2. python setup.py develop"
+        )
+
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_routed_experts = num_routed_experts
+        self.ori_shape = (num_routed_experts, out_features, in_features)
+        self.ori_local_shape = (
+            (num_routed_experts // ep_mesh.size(), out_features, in_features)
+            if ep_mesh is not None
+            else self.ori_shape
+        )
+
+        # We have padded the dim0 of GroupedLinear's weight to make fsdp compatible with block-wise fp8.
+        # if padded_out_features is None:
+        #     padded_out_features = num_routed_experts * out_features
+        weight = WeightWithDynamicTilewiseFloat8CastTensor(
+            torch.empty(num_routed_experts * out_features, in_features),
+            torch.float8_e4m3fn,
+            (num_routed_experts * out_features, in_features),
+        )
+
+        assert not (ep_mesh is not None and ep_mesh.size() > 1 and moe_tp_mesh is not None and moe_tp_mesh.size() > 1), "Only one of ep_mesh and moe_tp_mesh should be provided."
+        self.moe_tp_mesh = moe_tp_mesh
+        self.ep_mesh = ep_mesh
+        if self.moe_tp_mesh is not None and self.moe_tp_mesh.size() > 1:
+            tp_size = self.moe_tp_mesh.size()
+            weight = WeightWithDynamicTilewiseFloat8CastTensor(
+                torch.empty(num_routed_experts * out_features // tp_size, in_features),
+                torch.float8_e4m3fn,
+                (num_routed_experts * out_features // tp_size, in_features),
+            )
+            self.out_features = out_features // tp_size
+            self.ori_shape = (num_routed_experts, out_features // tp_size, in_features)
+            self.ori_local_shape = (num_routed_experts, out_features // tp_size, in_features)
+            self.weight = nn.Parameter(weight)
+        elif ep_mesh is not None and ep_mesh.size() > 1:
+            self.weight = nn.Parameter(distribute_tensor(weight, ep_mesh, [Shard(0)]))
+        else:
+            self.weight = nn.Parameter(weight)
+
+        self.pad_shape: Optional[Tuple[int, int]] = None
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def _check_shape(self, weight):
+        if self.is_padded:
+            # We dont support padding for EP training.
+            assert weight.shape == self.pad_shape, f"Expected weight shape {self.pad_shape}, but got {weight.shape}."
+        else:
+            # EP1 without padding or EP training
+            assert weight.shape == (self.ori_local_shape[0] * self.ori_local_shape[1], self.ori_local_shape[2]), (
+                f"Expected weight shape {(self.ori_local_shape[0] * self.ori_local_shape[1], self.ori_local_shape[2])}, "
+                f"but got {weight.shape}."
+            )
+
+    def forward(self, input: torch.Tensor, tokens_per_expert, decoding: bool = False) -> torch.Tensor:
+        weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
+
+        self._check_shape(weight)
+
+        if tensor_already_casted_to_fp8(weight):
+            # If we use fsdp, the weight is already casted to fp8.
+            # If self.is_padded is True, ep size should be 1
+            weight_fp8 = slice_weight.apply(weight, self.ori_local_shape) if self.is_padded else weight
+            weight_fp8 = view_weight.apply(weight_fp8, self.ori_local_shape)
+        else:
+            weight = weight.view(*self.ori_local_shape)
+            weight_fp8 = weight_to_per_block_float8_dynamic.apply(weight, torch.float8_e4m3fn, 128)
+
+        orig_shape = input.shape
+        input = input.view(-1, input.shape[-1])
+        out = fp8_gmm_weight_per_block_act_per_tile1.apply(input, weight_fp8, tokens_per_expert)
+        out = out.view(*orig_shape[:-1], -1)
+        return out
+
+    @property
+    def is_padded(self) -> bool:
+        return self.pad_shape is not None
+
+    def pad_for_fsdp(self, padded_out_features: int) -> None:
+        """Pad the weight to make it compatible with fsdp."""
+        assert padded_out_features >= self.weight.shape[0], (
+            f"Expected padded_out_features {padded_out_features} >= self.weight.shape[0] {self.weight.shape[0]}."
+        )
+        assert padded_out_features % 128 == 0, (
+            f"padded_out_features {padded_out_features} must be divisible by 128 for tile-wise fp8."
+        )
+        assert self.in_features % 128 == 0, (
+            f"self.in_features {self.in_features} must be divisible by 128 for tile-wise fp8."
+        )
+        if padded_out_features == self.weight.shape[0]:
+            return
+        if isinstance(self.weight, DTensor):
+            assert padded_out_features == self.weight.shape[0], "Padding is not support for EP training."
+            return
+        weight = torch.empty(
+            (padded_out_features, self.in_features),
+            dtype=self.weight.dtype,
+            layout=self.weight.layout,
+            device=self.weight.device,
+        )
+        weight[: self.weight.shape[0]].data.copy_(self.weight.data)  # copy the original weight
+        weight[self.weight.shape[0] :].data.copy_(0.0)  # type: ignore  # zero pad the weight
+        weight = WeightWithDynamicTilewiseFloat8CastTensor(
+            weight,
+            torch.float8_e4m3fn,
+            (self.num_routed_experts * self.out_features, self.in_features),
+        )
+        self.register_parameter("weight", nn.Parameter(weight))
+        self.pad_shape = (padded_out_features, self.in_features)
+
+    def extra_repr(self) -> str:
+        out = (
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"num_routed_experts={self.num_routed_experts}"
+        )
+        if self.is_padded:
+            out += f", padded_out_features={self.pad_shape[0]}"  # type: ignore
+        return out
+
+
+class TileWiseFloat8GroupedRowLinear(torch.nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        num_routed_experts: int,
+        moe_bias: bool = False,
+        ep_mesh: DeviceMesh | None = None,
+        moe_tp_mesh: DeviceMesh | None = None,
+    ) -> None:
+        super().__init__()
+
+        assert moe_bias is False, "TileWiseFloat8GroupedLinear only supports moe_bias=False for now."
+
+        assert ADAPTIVEGEMM_INSTALLED, (
+            "Please install adaptive_gemm:"
+            "1. git clone --recursive git@github.com:InternLM/AdaptiveGEMM.git\n"
+            "2. python setup.py develop"
+        )
+
+        self.in_features = in_features
+        self.out_features = out_features
+        self.num_routed_experts = num_routed_experts
+        self.ori_shape = (num_routed_experts, out_features, in_features)
+        self.ori_local_shape = (
+            (num_routed_experts // ep_mesh.size(), out_features, in_features)
+            if ep_mesh is not None
+            else self.ori_shape
+        )
+
+        # We have padded the dim0 of GroupedLinear's weight to make fsdp compatible with block-wise fp8.
+        # if padded_out_features is None:
+        #     padded_out_features = num_routed_experts * out_features
+        weight = WeightWithDynamicTilewiseFloat8CastTensor(
+            torch.empty(num_routed_experts * out_features, in_features),
+            torch.float8_e4m3fn,
+            (num_routed_experts * out_features, in_features),
+        )
+
+        assert not (ep_mesh is not None and ep_mesh.size() > 1 and moe_tp_mesh is not None and moe_tp_mesh.size() > 1), "Only one of ep_mesh and moe_tp_mesh should be provided."
+        self.moe_tp_mesh = moe_tp_mesh
+        self.ep_mesh = ep_mesh
+        if self.moe_tp_mesh is not None and self.moe_tp_mesh.size() > 1:
+            tp_size = self.moe_tp_mesh.size()
+            weight = WeightWithDynamicTilewiseFloat8CastTensor(
+                torch.empty(num_routed_experts * out_features, in_features // tp_size),
+                torch.float8_e4m3fn,
+                (num_routed_experts * out_features, in_features // tp_size),
+            )
+            self.in_features = in_features // tp_size
+            self.ori_shape = (num_routed_experts, out_features, in_features // tp_size)
+            self.ori_local_shape = (num_routed_experts, out_features, in_features // tp_size)
+            self.weight = nn.Parameter(weight)
+        elif ep_mesh is not None and ep_mesh.size() > 1:
+            self.weight = nn.Parameter(distribute_tensor(weight, ep_mesh, [Shard(0)]))
+        else:
+            self.weight = nn.Parameter(weight)
+
+        self.pad_shape: Optional[Tuple[int, int]] = None
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def _check_shape(self, weight):
+        if self.is_padded:
+            # We dont support padding for EP training.
+            assert weight.shape == self.pad_shape, f"Expected weight shape {self.pad_shape}, but got {weight.shape}."
+        else:
+            # EP1 without padding or EP training
+            assert weight.shape == (self.ori_local_shape[0] * self.ori_local_shape[1], self.ori_local_shape[2]), (
+                f"Expected weight shape {(self.ori_local_shape[0] * self.ori_local_shape[1], self.ori_local_shape[2])}, "
+                f"but got {weight.shape}."
+            )
+
+    def forward(self, input: torch.Tensor, tokens_per_expert, decoding: bool = False) -> torch.Tensor:
+        weight = self.weight.to_local() if isinstance(self.weight, DTensor) else self.weight
+
+        self._check_shape(weight)
+
+        if tensor_already_casted_to_fp8(weight):
+            # If we use fsdp, the weight is already casted to fp8.
+            # If self.is_padded is True, ep size should be 1
+            weight_fp8 = slice_weight.apply(weight, self.ori_local_shape) if self.is_padded else weight
+            weight_fp8 = view_weight.apply(weight_fp8, self.ori_local_shape)
+        else:
+            weight = weight.view(*self.ori_local_shape)
+            weight_fp8 = weight_to_per_block_float8_dynamic.apply(weight, torch.float8_e4m3fn, 128)
+
+        orig_shape = input.shape
+        input = input.view(-1, input.shape[-1])
+        out = fp8_gmm_weight_per_block_act_per_tile1.apply(input, weight_fp8, tokens_per_expert)
         out = out.view(*orig_shape[:-1], -1)
         return out
 

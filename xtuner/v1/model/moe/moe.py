@@ -94,6 +94,8 @@ class MoEConfig(TransformerConfig):
     hidden_factor: Annotated[float, Parameter(group="moe")] = 1.0
     moe_intermediate_size: Annotated[int, Parameter(group="moe")]
     ep_size: Annotated[int, Parameter(group="moe")] = 1
+    tp_size: Annotated[int, Parameter(group="moe")] = 1
+    moe_tp_size: Annotated[int, Parameter(help="MoE tensor parallel size")] = 1
     dispatcher: Annotated[Literal["deepep", "all2all"] | None, Parameter(group="moe")] = None
     router: GreedyRouterConfig | NoAuxRouterConfig
     balancing_loss_cfg: BalancingLossConfig | None = BalancingLossConfig()
@@ -120,6 +122,8 @@ class MoE(BaseModel):
 
     config: MoEConfig
     ep_mesh: DeviceMesh | None = None
+    tp_mesh: DeviceMesh | None = None
+    moe_tp_mesh: DeviceMesh | None = None
 
     def __init__(self, config: MoEConfig):
         super().__init__()
@@ -132,6 +136,15 @@ class MoE(BaseModel):
             )["ep"]
         else:
             self.ep_mesh = None
+        if config.moe_tp_size is not None and config.moe_tp_size > 1:
+            world_size = dist.get_world_size()
+            self.moe_tp_mesh = init_device_mesh(
+                DEVICE,
+                (world_size // config.moe_tp_size, config.moe_tp_size),
+                mesh_dim_names=("dp", "moe_tp"),
+            )["moe_tp"]
+        else:
+            self.moe_tp_mesh = None
         self.config = config
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -158,6 +171,8 @@ class MoE(BaseModel):
             self.z_loss = self.config.z_loss_cfg.build()
         else:
             self.z_loss = None
+        
+        self.offload_stream = torch.cuda.Stream()  # For activation offload
 
     def _select_non_pad_router_logits(
         self,
@@ -296,24 +311,32 @@ class MoE(BaseModel):
         assert len(seq_ctx_list) == len(loss_ctx_list), "seq_ctx and loss_ctx must have same length"
 
         # Prepare input embeddings for all micro-batches
-        hidden_states_list: list[torch.Tensor] = []
-        position_embeddings_list = []
+        # hidden_states_list: list[torch.Tensor] = []
+        # position_embeddings_list = []
 
-        for ctx in seq_ctx_list:
-            input_ids = ctx.input_ids
-            position_ids = ctx.position_ids
+        # for ctx in seq_ctx_list:
+        #     input_ids = ctx.input_ids
+        #     position_ids = ctx.position_ids
 
-            if input_ids is not None:
-                hidden_states = self.embed_tokens(input_ids)
-            else:
-                hidden_states = ctx.inputs_embeds
+        #     if input_ids is not None:
+        #         hidden_states = self.embed_tokens(input_ids)
+        #     else:
+        #         hidden_states = ctx.inputs_embeds
 
-            # create position embeddings to be shared across the decoder layers
-            assert position_ids is not None
-            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        #     # create position embeddings to be shared across the decoder layers
+        #     position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-            hidden_states_list.append(hidden_states)
-            position_embeddings_list.append(position_embeddings)
+        #     hidden_states_list.append(hidden_states)
+        #     position_embeddings_list.append(position_embeddings)
+        
+        if seq_ctx_list[0].input_ids is None:
+            cat_hidden_states = torch.cat([ctx.inputs_embeds for ctx in seq_ctx_list], dim=1)
+        else:
+            cat_input_ids = torch.cat([ctx.input_ids for ctx in seq_ctx_list], dim=1)
+            cat_hidden_states = self.embed_tokens(cat_input_ids)
+        cat_position_ids = torch.cat([ctx.position_ids for ctx in seq_ctx_list], dim=1)
+        cat_position_embeddings = self.rotary_emb(cat_hidden_states, cat_position_ids)
+        position_embeddings_list = list(zip(cat_position_embeddings[0].chunk(len(seq_ctx_list), dim=1), cat_position_embeddings[1].chunk(len(seq_ctx_list), dim=1)))
 
         # Initialize output containers
         output: dict = {}
@@ -322,8 +345,8 @@ class MoE(BaseModel):
 
         # Process through layers
         cat_seq_ctx: SequenceContext | None = None
-        cat_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None
-        cat_hidden_states: torch.Tensor | None = None
+        # cat_position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None
+        # cat_hidden_states: torch.Tensor | None = None
 
         moe_forawrd = False
         for idx, decoder_layer in self.layers.items():
@@ -332,10 +355,10 @@ class MoE(BaseModel):
             if layer_idx < self.config.first_k_dense_replace:
                 if cat_seq_ctx is None:
                     cat_seq_ctx = SequenceContext.pack(seq_ctx_list)
-                    cos = torch.cat([pe[0] for pe in position_embeddings_list], dim=1)
-                    sin = torch.cat([pe[1] for pe in position_embeddings_list], dim=1)
-                    cat_position_embeddings = (cos, sin)
-                    cat_hidden_states = torch.cat(hidden_states_list, dim=1)
+                    # cos = torch.cat([pe[0] for pe in position_embeddings_list], dim=1)
+                    # sin = torch.cat([pe[1] for pe in position_embeddings_list], dim=1)
+                    # cat_position_embeddings = (cos, sin)
+                    # cat_hidden_states = torch.cat(hidden_states_list, dim=1)
                 # Dense decoder layer - process concated hidden states
                 cat_hidden_states = decoder_layer(
                     cat_hidden_states,
@@ -343,7 +366,8 @@ class MoE(BaseModel):
                     seq_ctx=cat_seq_ctx,
                 )
             else:
-                if cat_hidden_states is not None and not moe_forawrd:
+                # if cat_hidden_states is not None and not moe_forawrd:
+                if not moe_forawrd:
                     # TODO: `i.clone()` here is weird. However, the current Implementation of
                     # `async_save_on_cpu` is not friendly with `chunk` op (maybe caused by shared storage? not sure),
                     # resulting in nan grad norm. So we have to clone the chunked tensors here to make sure each
@@ -355,8 +379,8 @@ class MoE(BaseModel):
                 if int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) == 1:
                     offload_stream = decoder_layer._get_fsdp_state()._comm_ctx.all_gather_copy_in_stream
                     with async_save_on_cpu(
-                        h2d_stream=offload_stream,
-                        d2h_stream=offload_stream,
+                        h2d_stream=self.offload_stream,
+                        d2h_stream=self.offload_stream,
                         block_idx=layer_idx - self.config.first_k_dense_replace,
                         depth=len(self.layers) - self.config.first_k_dense_replace,
                         custom_check_fn=lambda x: x.data_ptr()
@@ -496,8 +520,8 @@ class MoE(BaseModel):
                 if int(os.getenv("XTUNER_ACTIVATION_OFFLOAD", "0")) == 1:
                     offload_stream = decoder_layer._get_fsdp_state()._comm_ctx.all_gather_copy_in_stream
                     with async_save_on_cpu(
-                        h2d_stream=offload_stream,
-                        d2h_stream=offload_stream,
+                        h2d_stream=self.offload_stream,
+                        d2h_stream=self.offload_stream,
                         block_idx=int(idx),
                         depth=len(self.layers),
                         custom_check_fn=lambda x: x.data_ptr() == hidden_states.data_ptr(),
@@ -604,6 +628,7 @@ class MoE(BaseModel):
                     layer_idx=layer_idx,
                     dispatcher=config.dispatcher,
                     ep_mesh=self.ep_mesh,
+                    moe_tp_mesh=self.moe_tp_mesh,
                 )
                 if self.config.freeze_routers:
                     layers[str(layer_idx)].gate.requires_grad_(False)
@@ -768,19 +793,32 @@ class MoE(BaseModel):
         experts_fsdp_size = world_size // self.fsdp_config.ep_size
 
         if self.fsdp_config.hsdp_sharding_size is None:
-            model_mesh = init_device_mesh(
-                device,
-                (experts_fsdp_size, self.fsdp_config.ep_size),
-                mesh_dim_names=(f"{self.fsdp_config.mesh_prefix}.fsdp", f"{self.fsdp_config.mesh_prefix}.ep"),
-            )
-            if self.ep_mesh is not None:
-                assert torch.equal(self.ep_mesh.mesh, model_mesh[f"{self.fsdp_config.mesh_prefix}.ep"].mesh), (
-                    "FSDP enabled, it requires the `ep_size` of model config equals to the `ep_size` of FSDPConfig."
+            if self.fsdp_config.moe_tp_size > 1:
+                experts_fsdp_size = world_size // self.fsdp_config.moe_tp_size
+                self.ep_mesh = init_device_mesh(device, (world_size, 1), mesh_dim_names=("_", f"{self.fsdp_config.mesh_prefix}.ep"))[f"{self.fsdp_config.mesh_prefix}.ep"]
+                model_mesh = init_device_mesh(
+                    device,
+                    (experts_fsdp_size, self.fsdp_config.moe_tp_size),
+                    mesh_dim_names=(f"{self.fsdp_config.mesh_prefix}.fsdp", f"{self.fsdp_config.mesh_prefix}.moe_tp"),
                 )
-            self.ep_mesh = model_mesh[f"{self.fsdp_config.mesh_prefix}.ep"]
-            self.fsdp_mesh = model_mesh[f"{self.fsdp_config.mesh_prefix}.fsdp"]
+                self.moe_tp_mesh = model_mesh[f"{self.fsdp_config.mesh_prefix}.moe_tp"]
+                self.fsdp_mesh = model_mesh[f"{self.fsdp_config.mesh_prefix}.fsdp"]
+            else:
+                self.moe_tp_mesh = init_device_mesh(device, (world_size, 1), mesh_dim_names=("_", f"{self.fsdp_config.mesh_prefix}.moe_tp"))[f"{self.fsdp_config.mesh_prefix}.moe_tp"]
+                model_mesh = init_device_mesh(
+                    device,
+                    (experts_fsdp_size, self.fsdp_config.ep_size),
+                    mesh_dim_names=(f"{self.fsdp_config.mesh_prefix}.fsdp", f"{self.fsdp_config.mesh_prefix}.ep"),
+                )
+                if self.ep_mesh is not None:
+                    assert torch.equal(self.ep_mesh.mesh, model_mesh[f"{self.fsdp_config.mesh_prefix}.ep"].mesh), (
+                        "FSDP enabled, it requires the `ep_size` of model config equals to the `ep_size` of FSDPConfig."
+                    )
+                self.ep_mesh = model_mesh[f"{self.fsdp_config.mesh_prefix}.ep"]
+                self.fsdp_mesh = model_mesh[f"{self.fsdp_config.mesh_prefix}.fsdp"]
         else:
             assert self.fsdp_config.ep_size == 1, "Currently, HSDP requires expert parallel size to be 1"
+            assert self.fsdp_config.moe_tp_size == 1, "Currently, HSDP requires tensor parallel size to be 1"
             # We can not init ep_mesh and fsdp_mesh like this.
             # This will lead to "RuntimeError: Cannot create a submesh from a submesh."
             # in FSDPParam.shard_mesh, as fsdp_mesh is not the root mesh. The root mesh is model_mesh.
@@ -838,7 +876,7 @@ class MoE(BaseModel):
             if self.fsdp_config.torch_compile:
                 torch._dynamo.config.cache_size_limit = 256
                 if self.fsdp_config.compile_targets is None:
-                    if self.ep_mesh.size() > 1:
+                    if self.ep_mesh.size() > 1 or self.moe_tp_mesh.size() > 1:
                         # all_to_all_single_autograd in TorchAll2AllDispatcher.dispatch can not be compiled even if the fullgraph=False
                         # ref: https://github.com/pytorch/pytorch/issues/155205
                         # todo: decorate MoEDecoderLayer.forward with @torch.compile(fullgraph=False) when the bug is fixed

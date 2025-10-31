@@ -123,11 +123,12 @@ def precompute_tilewise_float8_scale_for_fsdp(
     reduce_mesh_devided_64: Optional[DeviceMesh] = None,  # All params share the same reduce mesh
 ) -> None:
     from xtuner.v1.float8 import TileWiseFloat8GroupedLinear, TileWiseFloat8Linear
+    from xtuner.v1.float8.float8_gmm_tile_wise import TileWiseFloat8GroupedColumnLinear, TileWiseFloat8GroupedRowLinear
 
     weights: List[WeightWithDynamicTilewiseFloat8CastTensor] = []
     for m in module.modules():
         if (
-            isinstance(m, (TileWiseFloat8Linear, TileWiseFloat8GroupedLinear))
+            isinstance(m, (TileWiseFloat8Linear, TileWiseFloat8GroupedLinear, TileWiseFloat8GroupedColumnLinear, TileWiseFloat8GroupedRowLinear))
             and isinstance(m.weight, DTensor)
             and isinstance(m.weight._local_tensor, WeightWithDynamicTilewiseFloat8CastTensor)
         ):

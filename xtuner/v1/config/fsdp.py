@@ -12,6 +12,7 @@ class FSDPConfig(BaseModel):
         protected_namespaces=(),
     )
     tp_size: Annotated[int, Parameter(help="Tensor parallel size")] = 1
+    moe_tp_size: Annotated[int, Parameter(help="MoE tensor parallel size")] = 1
     sp_size: Annotated[int, Parameter(help="Sequence parallel size")] = 1
     ep_size: Annotated[int, Parameter(help="Expert parallel size")] = 1
     reshard_after_forward: Annotated[bool, Parameter(help="Reshard model parameters after forward pass")] = True

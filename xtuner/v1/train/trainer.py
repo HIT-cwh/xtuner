@@ -488,7 +488,17 @@ class Trainer:
                     )
                 )
 
+            torch.cuda.synchronize()
+            tensor_in = torch.arange(1, dtype=torch.int32, device='cuda')
+            dist.all_reduce(tensor_in, op=dist.ReduceOp.SUM)
+            torch.cuda.synchronize()
+            time_before_train_step = time.time()
+            
             with self._maybe_profiling():
+                torch.cuda.synchronize()
+                tensor_in = torch.arange(1, dtype=torch.int32, device='cuda')
+                dist.all_reduce(tensor_in, op=dist.ReduceOp.SUM)
+                torch.cuda.synchronize()
                 loss_log, other_log = self._engine.train_step(engine_input)
 
             grad_norm = self._engine.clip_grad_norm()

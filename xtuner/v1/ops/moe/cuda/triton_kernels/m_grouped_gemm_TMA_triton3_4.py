@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from typing import Optional
+import os
 
 import torch
 import triton
@@ -280,7 +281,8 @@ def m_grouped_gemm(
     group_end = size_per_group.cumsum(0) - size_per_group + size_per_group
     group_start = size_per_group.cumsum(0) - size_per_group
 
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count if numSM <= 0 else numSM
+    MinusSM = int(os.environ.get("MinusSM", 0))
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count - MinusSM
 
     dtype_mapping = {torch.bfloat16: 0, torch.float16: 1}
     dtype_a = dtype_mapping.get(A.dtype, -1)
@@ -383,7 +385,6 @@ if __name__ == "__main__":
         script_path = Path(__file__).resolve()
         parent_dir = script_path.parent.parent
         trace_file = f"{parent_dir}/trace/gmm_triton_cublas_cutlass_N{n}_K{k}" + ".json"
-        import os
 
         Path(os.path.join(parent_dir, "trace")).mkdir(parents=True, exist_ok=True)
 

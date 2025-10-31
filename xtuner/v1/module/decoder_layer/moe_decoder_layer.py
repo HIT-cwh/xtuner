@@ -26,6 +26,7 @@ from xtuner.v1.module.rope import RopeScalingConfig
 from xtuner.v1.ops.act_fn import get_act_fn
 from xtuner.v1.utils import ForwardState
 from xtuner.v1.utils.compile import maybe_compile
+from torch.distributed._functional_collectives import all_gather_tensor_autograd, reduce_scatter_tensor_autograd, AsyncCollectiveTensor
 
 from ..linear.linear import build_linear
 
@@ -130,6 +131,7 @@ class MoEBlock(nn.Module):
         n_routed_experts: int,
         moe_bias: bool = False,
         ep_mesh: DeviceMesh | None = None,
+        moe_tp_mesh: DeviceMesh | None = None,
         float8_cfg: Float8Config | None = None,
         moe_act_fn_cfg: MoEActFnConfig,
     ):
@@ -138,7 +140,9 @@ class MoEBlock(nn.Module):
         self.intermediate_size = moe_intermediate_size
         self.num_routed_experts = n_routed_experts
 
+        assert not (ep_mesh is not None and ep_mesh.size() > 1 and moe_tp_mesh is not None and moe_tp_mesh.size() > 1), f"Only one of ep_mesh and tp_mesh should be provided. got {ep_mesh}, {moe_tp_mesh}"
         self.ep_mesh = ep_mesh
+        self.moe_tp_mesh = moe_tp_mesh
         # self.fused_w1 = GroupedLinear(self.hidden_size, self.intermediate_size, self.num_routed_experts, ep_mesh)
         # self.fused_w3 = GroupedLinear(self.hidden_size, self.intermediate_size, self.num_routed_experts, ep_mesh)
         self.fused_w1w3 = build_grouped_linear(
@@ -147,7 +151,9 @@ class MoEBlock(nn.Module):
             self.num_routed_experts,
             moe_bias=moe_bias,
             ep_mesh=self.ep_mesh,
+            moe_tp_mesh=self.moe_tp_mesh,
             float8_cfg=float8_cfg,
+            tp="column",
         )
         self.fused_w2 = build_grouped_linear(
             self.intermediate_size,
@@ -155,7 +161,9 @@ class MoEBlock(nn.Module):
             self.num_routed_experts,
             moe_bias=moe_bias,
             ep_mesh=self.ep_mesh,
+            moe_tp_mesh=self.moe_tp_mesh,
             float8_cfg=float8_cfg,
+            tp="row",
         )
         self.moe_act = moe_act_fn_cfg.build()
 
@@ -195,6 +203,7 @@ class MoEDecoderLayer(nn.Module):
         layer_idx: int = 0,
         dispatcher: Literal["deepep", "all2all"] | None,
         ep_mesh: DeviceMesh | None = None,
+        moe_tp_mesh: DeviceMesh | None = None,
     ):
         super().__init__()
         self.ep_mesh = ep_mesh
@@ -242,6 +251,7 @@ class MoEDecoderLayer(nn.Module):
             n_routed_experts=n_routed_experts,
             moe_bias=moe_bias,
             ep_mesh=ep_mesh,
+            moe_tp_mesh=moe_tp_mesh,
             float8_cfg=float8_cfg,
             moe_act_fn_cfg=moe_act_fn_cfg,
         )
@@ -251,6 +261,7 @@ class MoEDecoderLayer(nn.Module):
             dispatcher=dispatcher,
             n_routed_experts=n_routed_experts,
             ep_group=process_group,
+            moe_tp_group=moe_tp_mesh.get_group() if moe_tp_mesh is not None else None,
             training_dtype="fp8" if float8_cfg is not None else "bf16",
             generate_dtype=generate_config.dtype if generate_config is not None else "bf16",
         )

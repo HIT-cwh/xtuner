@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from typing import Optional
+import os
 
 import torch
 import triton
@@ -159,8 +160,9 @@ def k_grouped_gemm(A: Tensor, B: Tensor, size_per_group: torch.Tensor) -> Tensor
     assert dtype_a >= 0, f"data type {A.dtype} not supported"
     assert dtype_b >= 0, f"data type {B.dtype} not supported"
     assert dtype_c >= 0, f"data type {C.dtype} not supported"
-
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    
+    MinusSM = int(os.environ.get("MinusSM", 0))
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count - MinusSM
 
     def grid(META):
         # assert N % META["BLOCK_N"] == 0, "Only support when N is a multiple of BLOCK_N"
@@ -245,7 +247,6 @@ if __name__ == "__main__":
         script_path = Path(__file__).resolve()
         parent_dir = script_path.parent.parent
         trace_file = f"{parent_dir}/trace/gmm_dw_triton_cublas_cutlass_M{m}_N{n}" + ".json"
-        import os
 
         Path(os.path.join(parent_dir, "trace")).mkdir(parents=True, exist_ok=True)
 
