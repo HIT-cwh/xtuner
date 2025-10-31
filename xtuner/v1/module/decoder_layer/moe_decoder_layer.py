@@ -464,6 +464,16 @@ class MoEDecoderLayer(nn.Module):
                 async_op=True,
             )
             combined_list.append(combined)
+        
+        if self.n_shared_experts > 0:
+            shared_experts_out_list: list[torch.Tensor] = []
+            for pre_moe_forward_out in pre_moe_forward_out_list:
+                shared_experts_out = self._shared_experts_forward(
+                    hidden_states=pre_moe_forward_out,
+                )
+                shared_experts_out_list.append(shared_experts_out)
+        else:
+            shared_experts_out_list = [None] * intra_layer_micro_batch
 
         hidden_states_out_list: list[torch.Tensor] = []
         for i in range(intra_layer_micro_batch):
@@ -476,9 +486,10 @@ class MoEDecoderLayer(nn.Module):
                 async_op=True,
             )
             hidden_states = self._post_moe_forward(
-                hidden_states=pre_moe_forward_out_list[i],
+                # hidden_states=pre_moe_forward_out_list[i],
                 combined_hidden_states=post_combined["hidden_states"].view(*pre_moe_forward_out_list[i].shape),
                 residual=residual_list[i],
+                shared_experts_out=shared_experts_out_list[i],
             )
             hidden_states_out_list.append(hidden_states)
 
@@ -532,21 +543,41 @@ class MoEDecoderLayer(nn.Module):
 
         router_results: RouterResults = self.gate(hidden_states)
         return residual, hidden_states, router_results
-
+    
+    @maybe_compile(fullgraph=True)
+    def _shared_experts_forward(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self.shared_experts is not None, "Shared experts should be initialized when n_shared_experts > 0"
+        shared_experts_out = self.shared_experts(hidden_states)
+        return shared_experts_out
+    
     @maybe_compile(fullgraph=True)
     def _post_moe_forward(
         self,
-        hidden_states: torch.Tensor,
         combined_hidden_states: torch.Tensor,
         residual: torch.Tensor,
+        shared_experts_out: torch.Tensor | None,
     ) -> torch.Tensor:
-        # This part can be fullgraph compiled
         if self.n_shared_experts > 0:
-            assert self.shared_experts is not None, "Shared experts should be initialized when n_shared_experts > 0"
-            shared_experts_out = self.shared_experts(hidden_states)
             combined_hidden_states = combined_hidden_states + shared_experts_out
-
         return combined_hidden_states * self.hidden_factor + residual
+
+    # @maybe_compile(fullgraph=True)
+    # def _post_moe_forward(
+    #     self,
+    #     hidden_states: torch.Tensor,
+    #     combined_hidden_states: torch.Tensor,
+    #     residual: torch.Tensor,
+    # ) -> torch.Tensor:
+    #     # This part can be fullgraph compiled
+    #     if self.n_shared_experts > 0:
+    #         assert self.shared_experts is not None, "Shared experts should be initialized when n_shared_experts > 0"
+    #         shared_experts_out = self.shared_experts(hidden_states)
+    #         combined_hidden_states = combined_hidden_states + shared_experts_out
+
+    #     return combined_hidden_states * self.hidden_factor + residual
 
     def build_kv_cache(
         self, max_batch_size: int | None = None, max_length: int | None = None, block_size: int | None = None
