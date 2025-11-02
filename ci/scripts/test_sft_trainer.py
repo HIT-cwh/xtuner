@@ -232,38 +232,40 @@ def main():
     torch_compile = os.environ.get("TORCH_COMPILE", "true").lower() == "true"
     fp8 = os.environ.get("FP8", "true").lower() == "true"
     hf_interval = int(os.environ.get("HF_INTERVAL", 100000000000))
+    use_grouped_router = os.environ.get("USE_GROUPED_ROUTER", "false").lower() == "true"
 
     moe_cfgs = [
-        (
-            Qwen3MoE30BA3Config(
-                # balancing_loss_cfg=None,
-                ep_size=ep_size,
-                dispatcher=dispatcher,
-                float8_cfg=Float8Config(
-                    scaling_granularity_gemm=ScalingGranularity.TILEWISE,
-                    scaling_granularity_grouped_gemm=ScalingGranularity.TILEWISE,
-                ) if fp8 else None,
-                # n_routed_experts=n_routed_experts,
-                # hidden_size=4096,
-                # moe_intermediate_size=1536,
-            ), 
-            f"ep{ep_size}"
-        ),
-        # (DeepSeekV3Config(
-        #     ep_size=ep_size,
-        #     eos_token_id=1,
-        #     num_hidden_layers=num_hidden_layers, 
-        #     first_k_dense_replace=first_k_dense_replace,
-        #     n_routed_experts=n_routed_experts, 
-        #     balancing_loss_cfg=None,
-        #     float8_cfg=Float8Config(
-        #         scaling_granularity_gemm=ScalingGranularity.TILEWISE,
-        #         scaling_granularity_grouped_gemm=ScalingGranularity.TILEWISE,
-        #     ),
-        #     dispatcher=dispatcher if ep_size > 1 else None,
-        #     ), f"ep{ep_size}"),
+        # (
+        #     Qwen3MoE30BA3Config(
+        #         # balancing_loss_cfg=None,
+        #         ep_size=ep_size,
+        #         dispatcher=dispatcher,
+        #         float8_cfg=Float8Config(
+        #             scaling_granularity_gemm=ScalingGranularity.TILEWISE,
+        #             scaling_granularity_grouped_gemm=ScalingGranularity.TILEWISE,
+        #         ) if fp8 else None,
+        #         # n_routed_experts=n_routed_experts,
+        #         # hidden_size=4096,
+        #         # moe_intermediate_size=1536,
+        #     ), 
+        #     f"ep{ep_size}"
+        # ),
+        (DeepSeekV3Config(
+            ep_size=ep_size,
+            eos_token_id=1,
+            num_hidden_layers=num_hidden_layers, 
+            first_k_dense_replace=first_k_dense_replace,
+            n_routed_experts=n_routed_experts, 
+            balancing_loss_cfg=None,
+            float8_cfg=Float8Config(
+                scaling_granularity_gemm=ScalingGranularity.TILEWISE,
+                scaling_granularity_grouped_gemm=ScalingGranularity.TILEWISE,
+            ) if fp8 else None,
+            dispatcher=dispatcher if ep_size > 1 else None,
+            ), f"ep{ep_size}"),
     ]
     for moe_cfg, name in moe_cfgs:
+        moe_cfg.router.use_grouped_router = use_grouped_router
         optim_cfg = AdamWConfig(lr=6e-05)
         lr_cfg = LRConfig(lr_type="cosine", lr_min=1e-6)
         fsdp_cfg = FSDPConfig(
