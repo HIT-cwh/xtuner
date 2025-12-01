@@ -96,7 +96,7 @@ class MoEConfig(TransformerConfig):
     hidden_factor: Annotated[float, Parameter(group="moe")] = 1.0
     moe_intermediate_size: Annotated[int, Parameter(group="moe")]
     ep_size: Annotated[int, Parameter(group="moe")] = 1
-    dispatcher: Annotated[Literal["deepep", "all2all", "agrs"] | None, Parameter(group="moe")] = None
+    dispatcher: Annotated[Literal["deepep", "all2all", "agrs", "agrs_customed"] | None, Parameter(group="moe")] = None
     router: GreedyRouterConfig | NoAuxRouterConfig
     balancing_loss_cfg: BalancingLossConfig | None = BalancingLossConfig()
     z_loss_cfg: ZLossConfig | None = None
@@ -856,6 +856,11 @@ class MoE(BaseModel):
                         # ref: https://github.com/pytorch/pytorch/issues/155205
                         # todo: decorate MoEDecoderLayer.forward with @torch.compile(fullgraph=False) when the bug is fixed
                         # so that we do not need to remove the compile target
+                        print(f"""
+                        maybe_compile.remove_compile_target(
+                            "xtuner.v1.module.decoder_layer.moe_decoder_layer.MoEDecoderLayer.forward"
+                        )
+                        """)
                         maybe_compile.remove_compile_target(
                             "xtuner.v1.module.decoder_layer.moe_decoder_layer.MoEDecoderLayer.forward"
                         )

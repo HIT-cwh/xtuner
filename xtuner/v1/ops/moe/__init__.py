@@ -13,6 +13,7 @@ from .protocol import (
     cpu_unpermute,
 )
 
+from .cuda import _permute, _unpermute, _unpermute_inplace, _unpermute_bwd
 
 def get_group_gemm() -> GroupGemmProtocol:
     from xtuner.v1.utils import get_device

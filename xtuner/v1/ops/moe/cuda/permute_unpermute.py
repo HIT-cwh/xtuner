@@ -55,6 +55,21 @@ def _unpermute(input: Tensor, row_id_map: Tensor, prob: Tensor, max_tokens: int,
         input = input.contiguous()
     return backend.unpermute(input, row_id_map, prob, max_tokens, num_topK)
 
+# @torch.library.custom_op("moe::unpermute_inplace", mutates_args=("output",))
+# def _unpermute_inplace(input: Tensor, output: Tensor, row_id_map: Tensor, prob: Tensor, max_tokens: int, num_topK: int) -> Tensor:
+#     if not input.is_contiguous():
+#         input = input.contiguous()
+#     if not output.is_contiguous():
+#         output = output.contiguous()
+
+#     backend.unpermute_inplace(input, output, row_id_map, prob, max_tokens, num_topK)
+
+def _unpermute_inplace(input: Tensor, output: Tensor, row_id_map: Tensor, prob: Tensor, max_tokens: int, num_topK: int) -> Tensor:
+    if not input.is_contiguous():
+        input = input.contiguous()
+    if not output.is_contiguous():
+        output = output.contiguous()
+
 
 @_unpermute.register_fake
 def _(input: Tensor, row_id_map: Tensor, prob: Tensor, max_tokens: int, num_topK: int) -> Tensor:

@@ -14,6 +14,7 @@ try:
     import grouped_gemm
 
     from .permute_unpermute import cuda_token_permute, cuda_token_unpermute
+    from .permute_unpermute import _permute, _unpermute, _unpermute_inplace, _unpermute_bwd
 except ImportError:
     from .permute_unpermute import cuda_token_permute_torch as cuda_token_permute
     from .permute_unpermute import cuda_token_unpermute_torch as cuda_token_unpermute

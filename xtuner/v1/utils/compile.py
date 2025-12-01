@@ -56,7 +56,8 @@ class MaybeCompile:
             original_func = func
             module_name = original_func.__module__
             func_name = original_func.__qualname__
-            func_id = f"{module_name}.{func_name}_id{_id}"
+            func_id = f"{module_name}.{func_name}"
+            # func_id = f"{module_name}.{func_name}_id{_id}"
 
             # Check if this function should be compiled
             should_compile = self._should_compile(module_name, func_name)
