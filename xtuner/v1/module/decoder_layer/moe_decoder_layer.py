@@ -196,7 +196,7 @@ class MoEDecoderLayer(nn.Module):
         moe_act_fn_cfg: MoEActFnConfig,
         float8_cfg: Float8Config | None = None,
         layer_idx: int = 0,
-        dispatcher: Literal["deepep", "all2all", "agrs", "agrs_customed"] | None,
+        dispatcher: Literal["deepep", "all2all", "agrs", "agrs_customed", "agrs_origin"] | None,
         ep_mesh: DeviceMesh | None = None,
     ):
         super().__init__()
@@ -256,6 +256,7 @@ class MoEDecoderLayer(nn.Module):
             ep_group=process_group,
             training_dtype="fp8" if float8_cfg is not None else "bf16",
             generate_dtype=generate_config.dtype if generate_config is not None else "bf16",
+            use_grouped_router=router_config.use_grouped_router,
         )
 
     @maybe_compile(fullgraph=True)

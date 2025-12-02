@@ -11,6 +11,7 @@ from torch.distributed._functional_collectives import (
     all_gather_tensor_autograd,
     reduce_scatter_tensor,
     reduce_scatter_tensor_autograd,
+    all_to_all_single_autograd,
 )
 from typing_extensions import override
 
@@ -620,7 +621,7 @@ class _AsyncDispatch(Function):
 
     @staticmethod
     def backward(
-        ctx, grad_output: torch.Tensor, *args
+        ctx, grad_output: torch.Tensor, grad_topk_ids: None, grad_topk_weights: torch.Tensor
     ) -> tuple[torch.Tensor | None, None, None, None, None, None, None, None, None]:
         world_size = dist.get_world_size(group=ctx.process_group)
         if world_size == 1:
@@ -687,15 +688,173 @@ class _AsyncDispatch(Function):
                     grad_output, reduceOp="sum", scatter_dim=0, group=ctx.process_group
                 )
                 
+            grad_topk_weights = grad_topk_weights.view(-1)
+            combined_grad_topk_weights = torch.empty_like(grad_topk_weights)
+            dist.all_to_all_single(
+                combined_grad_topk_weights,
+                grad_topk_weights,
+                group=ctx.process_group,
+            )
+            combined_grad_topk_weights = combined_grad_topk_weights.view(world_size, -1)
+            combined_grad_topk_weights = combined_grad_topk_weights.T.contiguous()
 
             grad_output.record_stream(ctx.comm_stream)
             combined_grad_output.record_stream(ctx.comm_stream)
+            combined_grad_topk_weights.record_stream(ctx.comm_stream)
             if ctx.backward_finished_event is not None:
                 ctx.backward_finished_event.record(ctx.comm_stream)
-        return combined_grad_output, None, None, None, None, None, None, None, None
+        return combined_grad_output, None, combined_grad_topk_weights, None, None, None, None, None, None
 
 
 _async_dispatch = copy_method_signature(_AsyncDispatch.forward)(_AsyncDispatch.apply)
+
+
+class _AsyncDispatchWOGrouped(Function):
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        forward_previous_event: torch.cuda.Event,
+        forward_finished_event: torch.cuda.Event,
+        backward_previous_event: torch.cuda.Event,
+        backward_finished_event: torch.cuda.Event,
+        comm_stream: torch.cuda.Stream,
+        process_group: dist.ProcessGroup,
+    ):
+        with torch.cuda.stream(comm_stream):
+            comm_stream.wait_event(forward_previous_event)
+            global ag_manager, use_custom_ag, ag_symm
+            if use_custom_ag:
+                if ag_symm == None:
+                    ag_symm = SymmBufferManager(int(os.getenv("SYMM_BUF_SIZE", 0)), num_buffers=2)
+                if ag_manager == None:
+                    ag_manager = AllGatherIBManager(comm_buf_size=2, use_custom_ag=use_custom_ag)
+
+                send_bytes = hidden_states.element_size() * hidden_states.numel()
+                recv_bytes = send_bytes * process_group.size()
+                recv_numel = hidden_states.numel() * process_group.size()
+
+                ag_manager.get_allgather_objects(
+                    send_bytes=send_bytes,
+                    group=process_group,
+                    all_gather_stream=comm_stream
+                )
+                device = hidden_states.device
+                dtype = hidden_states.dtype
+                combined_grad_out_symm = ag_symm.get_buffer(bytes=recv_bytes, device=device)
+                combined_grad_out_symm = combined_grad_out_symm.view(dtype)[ : recv_numel]
+                
+                AllGatherIBTensorAutograd.apply(ag_manager, send_bytes, combined_grad_out_symm, hidden_states, process_group)
+                # Need to copy from symmetric to private
+                # dispatched_hidden_states = torch.empty_like(combined_grad_out_symm)
+                # dispatched_hidden_states.copy_(combined_grad_out_symm)
+                # copy_tensor_in_chunks(combined_grad_out_symm, dispatched_hidden_states, chunk_size_gb=0.05)
+
+                # copy_no_cache(src = combined_grad_out_symm, dst = dispatched_hidden_states, stream = comm_stream, gridSize = 4, blockSize = 1024)
+                dispatched_hidden_states = combined_grad_out_symm
+                dispatched_hidden_states = dispatched_hidden_states.view(-1, *hidden_states.shape[1:])
+
+            else:
+                dispatched_hidden_states = all_gather_tensor_autograd(hidden_states, gather_dim=0, group=process_group)
+
+            if isinstance(dispatched_hidden_states, AsyncCollectiveTensor):
+                dispatched_hidden_states = dispatched_hidden_states.wait()
+
+            dispatched_topk_ids = topk_ids.new_empty(
+                (topk_ids.size(0) * process_group.size(), topk_ids.size(1))
+            )
+            dist.all_gather_into_tensor(dispatched_topk_ids, topk_ids, group=process_group)
+            dispatched_topk_weights = topk_weights.new_empty(
+                (topk_weights.size(0) * process_group.size(), topk_weights.size(1)))
+            dist.all_gather_into_tensor(dispatched_topk_weights, topk_weights, group=process_group)
+
+            dispatched_hidden_states.record_stream(comm_stream)
+            dispatched_topk_ids.record_stream(comm_stream)
+            dispatched_topk_weights.record_stream(comm_stream)
+            forward_finished_event.record(comm_stream)
+
+        ctx.backward_previous_event = backward_previous_event
+        ctx.backward_finished_event = backward_finished_event
+        ctx.process_group = process_group
+        ctx.comm_stream = comm_stream
+        return dispatched_hidden_states, dispatched_topk_ids, dispatched_topk_weights
+
+    @staticmethod
+    def backward(
+        ctx, grad_output: torch.Tensor, grad_topk_ids: None, grad_topk_weights: torch.Tensor
+    ) -> tuple[torch.Tensor | None, None, None, None, None, None, None, None, None]:
+        world_size = dist.get_world_size(group=ctx.process_group)
+        if world_size == 1:
+            return grad_output, None, None, None, None, None, None, None, None
+
+        with torch.cuda.stream(ctx.comm_stream):
+            if ctx.backward_previous_event is not None:
+                ctx.comm_stream.wait_event(ctx.backward_previous_event)
+
+            global rs_manager, use_custom_rs, rs_symm
+
+            if use_custom_rs:
+
+                # Initialize global managers if needed
+                if rs_symm is None:
+                    rs_symm = SymmBufferManager(int(os.getenv("SYMM_BUF_SIZE", 0)), num_buffers=1)
+                if rs_manager is None:
+                    rs_manager = ReduceScatterIBManager(comm_buf_size=2, use_custom_rs=use_custom_rs)
+
+                process_group = ctx.process_group
+                comm_stream = ctx.comm_stream
+                
+                send_bytes = grad_output.element_size() * grad_output.numel()
+                recv_bytes = send_bytes // process_group.size()
+                send_numel = grad_output.numel()
+                recv_numel = send_numel // process_group.size()
+
+                rs_manager.get_reducescatter_objects(
+                    recv_bytes_aligned=recv_bytes,
+                    group=process_group,
+                    reduce_scatter_stream=comm_stream
+                )
+                device = grad_output.device
+                dtype = grad_output.dtype
+                symm_input = rs_symm.get_buffer(bytes=send_bytes, device=device)
+                symm_input = symm_input.view(dtype)[ : send_numel]
+                symm_input.copy_(grad_output.flatten())
+                symm_input = symm_input.view(grad_output.shape)
+                # ib_wrapper.barrier_node_on_stream(comm_stream)
+                # torch.mul(grad_output.flatten(), 10**14, out = symm_input)
+
+                combined_grad_output = rs_manager.execute_reducescatter(
+                    recv_bytes=recv_bytes,
+                    reduce_scatter_input=symm_input,
+                    reduce_scatter_group=process_group,
+                    reduce_scatter_stream=comm_stream,
+                    reduce_scatter_reduce_op=dist.ReduceOp.SUM,
+                )
+                # combined_grad_output /= 10**14
+                combined_grad_output = combined_grad_output.view(-1, *grad_output.shape[1:])
+            else:
+                combined_grad_output = reduce_scatter_tensor(
+                    grad_output, reduceOp="sum", scatter_dim=0, group=ctx.process_group
+                )
+
+            grad_output.record_stream(ctx.comm_stream)
+            combined_grad_output.record_stream(ctx.comm_stream)
+
+            world_size = dist.get_world_size(group=ctx.process_group)
+            combined_grad_topk_weights = reduce_scatter_tensor(
+                grad_topk_weights, reduceOp="sum", scatter_dim=0, group=ctx.process_group
+            )
+            grad_topk_weights.record_stream(ctx.comm_stream)
+            combined_grad_topk_weights.record_stream(ctx.comm_stream)
+
+            if ctx.backward_finished_event is not None:
+                ctx.backward_finished_event.record(ctx.comm_stream)
+        return combined_grad_output, None, combined_grad_topk_weights, None, None, None, None, None, None
+
+
+_async_dispatch_wo_grouped = copy_method_signature(_AsyncDispatchWOGrouped.forward)(_AsyncDispatchWOGrouped.apply)
 
 
 class _AsyncCombine(Function):
@@ -853,6 +1012,7 @@ class MoEAGRSDispatcher(
         process_group: torch.distributed.ProcessGroup,
         training_dtype: Literal["fp8", "bf16"] = "bf16",
         generate_dtype: Literal["fp8", "bf16"] = "bf16",
+        use_grouped_router: bool = True,
     ):
         super().__init__(
             n_routed_experts=n_routed_experts,
@@ -867,6 +1027,10 @@ class MoEAGRSDispatcher(
         self._experts_per_rank = self._n_routed_experts // self._process_group.size()
         if MoEAGRSDispatcher._comm_stream is None:
             MoEAGRSDispatcher._comm_stream = cast(torch.cuda.Stream, torch.cuda.Stream(device=DEVICE))
+        
+        self._use_grouped_router = use_grouped_router
+        self.expert_idx_begin = dist.get_rank(group=self._process_group) * self._experts_per_rank
+        self.expert_idx_end = self.expert_idx_begin + self._experts_per_rank
 
     @override
     def dispatch_preprocess(
@@ -919,23 +1083,32 @@ class MoEAGRSDispatcher(
             if isinstance(dispatched_hidden_states, AsyncCollectiveTensor):
                 dispatched_hidden_states = dispatched_hidden_states.wait()
 
-            # topk_ids (seq, topk)
-            topk_ids = topk_ids.T.flatten()
-            dispatched_topk_ids = torch.empty_like(topk_ids)
-            dist.all_to_all_single(
-                dispatched_topk_ids,
-                topk_ids,
-                group=self._process_group,
-            )
-            dispatched_topk_ids = dispatched_topk_ids.view(-1, 1)
-            topk_weights = topk_weights.T.flatten()
-            dispatched_topk_weights = torch.empty_like(topk_weights)
-            dist.all_to_all_single(
-                dispatched_topk_weights,
-                topk_weights,
-                group=self._process_group,
-            )
-            dispatched_topk_weights = dispatched_topk_weights.view(-1, 1)
+            if self._use_grouped_router:
+                # topk_ids (seq, topk)
+                topk_ids = topk_ids.T.flatten()
+                dispatched_topk_ids = torch.empty_like(topk_ids)
+                dist.all_to_all_single(
+                    dispatched_topk_ids,
+                    topk_ids,
+                    group=self._process_group,
+                )
+                dispatched_topk_ids = dispatched_topk_ids.view(-1, 1)
+                topk_weights = topk_weights.T.flatten()
+                dispatched_topk_weights = all_to_all_single_autograd(
+                    topk_weights,
+                    group=self._process_group,
+                )
+                dispatched_topk_weights = dispatched_topk_weights.view(-1, 1)
+            else:
+                dispatched_topk_ids = topk_ids.new_empty(
+                    (topk_ids.size(0) * self._process_group.size(), topk_ids.size(1))
+                )
+                dist.all_gather_into_tensor(dispatched_topk_ids, topk_ids, group=self._process_group)
+                dispatched_topk_weights = all_gather_tensor_autograd(
+                    topk_weights, gather_dim=0, group=self._process_group
+                )
+                if isinstance(dispatched_topk_weights, AsyncCollectiveTensor):
+                    dispatched_topk_weights = dispatched_topk_weights.wait()
 
             return MoEAGRSDispatchResult(
                 hidden_states=cast(HiddenStates, dispatched_hidden_states),
@@ -950,7 +1123,8 @@ class MoEAGRSDispatcher(
             backward_finished_event = pre_dispatched["backward_previous_event"]
             backward_previous_event = cast(torch.cuda.Event, torch.cuda.Event())
 
-            dispatched_hidden_states, dispatched_topk_idx, dispatched_topk_weights = _async_dispatch(
+            _dispatch = _async_dispatch if self._use_grouped_router else _async_dispatch_wo_grouped
+            dispatched_hidden_states, dispatched_topk_idx, dispatched_topk_weights = _dispatch(
                 pre_dispatched["hidden_states"],
                 pre_dispatched["topk_ids"],
                 topk_weights,
@@ -982,15 +1156,28 @@ class MoEAGRSDispatcher(
             assert dispatched["forward_finished_event"] is not None, "Please use `async_op=True` for dispatch!"
             self.wait_comm_stream(dispatched["forward_finished_event"])
 
+        dispatched_topk_ids = dispatched["topk_ids"]
+        if self._use_grouped_router:
+            num_out_tokens = 0
+            num_negative_one_in_indices = 0
+        else:
+            mask = (dispatched_topk_ids >= self.expert_idx_begin) & (dispatched_topk_ids < self.expert_idx_end)
+            dispatched_topk_ids = torch.where(mask, dispatched_topk_ids, -1)
+            num_out_tokens = mask.sum().item()
+            num_negative_one_in_indices = mask.numel() - num_out_tokens
+        
+        dispatched["topk_ids"] = dispatched_topk_ids
         permuted_hidden_states, row_ids_map = permute(
             dispatched["hidden_states"],
-            dispatched["topk_ids"].to(torch.int32),
+            dispatched_topk_ids.to(torch.int32),
+            num_out_tokens=num_out_tokens,
+            num_negative_one_in_indices=num_negative_one_in_indices,
         )
 
-        topk_ids = dispatched["topk_ids"]
+        # topk_ids = dispatched["topk_ids"]
         rank = dist.get_rank(group=self._process_group)
         tokens_per_expert = torch.histc(
-            topk_ids,
+            dispatched_topk_ids,
             bins=self._experts_per_rank,
             min=rank * self._experts_per_rank,
             max=(rank + 1) * self._experts_per_rank,

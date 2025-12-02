@@ -72,7 +72,7 @@ class NoAuxRouter(nn.Module, RouterProtocol):
 
         self.norm_topk_prob = norm_topk_prob
         self.register_buffer(
-            "e_score_correction_bias", torch.empty((self.n_routed_experts), device=get_device(), dtype=torch.float32)
+            "e_score_correction_bias", torch.zeros((self.n_routed_experts), device=get_device(), dtype=torch.float32)
         )
 
     def forward(self, logits, rollout_routed_experts: torch.Tensor | None = None) -> RouterResults:
@@ -140,6 +140,7 @@ class NoAuxRouter(nn.Module, RouterProtocol):
             min=0,
             max=self.n_routed_experts,
         )  # .view(self.ep_mesh.size(), -1)
+        # print("tokens_per_expert:", tokens_per_expert)
 
         return {
             "logits": logits,

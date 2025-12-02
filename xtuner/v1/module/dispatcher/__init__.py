@@ -32,11 +32,12 @@ logger = get_logger()
 # TODO: (yehaochen) This interface declaration does not follow the Liskov Substitution Principle.
 # Maybe we should find a better way to handle the dispatchers.
 def build_dispatcher(
-    dispatcher: Literal["deepep", "all2all", "agrs", "agrs_customed"] | None,
+    dispatcher: Literal["deepep", "all2all", "agrs", "agrs_customed", "agrs_origin"] | None,
     n_routed_experts: int,
     ep_group: dist.ProcessGroup | None = None,
     training_dtype: Literal["bf16", "fp8"] = "bf16",
     generate_dtype: Literal["bf16", "fp8"] = "bf16",
+    use_grouped_router: bool = False,
 ) -> DispacherInterface:
     if ep_group is None or ep_group.size() == 1:
         if dispatcher is not None:
@@ -86,7 +87,19 @@ def build_dispatcher(
             process_group=ep_group,
             training_dtype=training_dtype,
             generate_dtype=generate_dtype,
+            use_grouped_router=use_grouped_router,
         ) 
+    elif dispatcher == "agrs_origin":
+        from .agrs_origin import MoEAGRSDispatcher1 as MoEAGRSOriginDispatcher
+
+        assert ep_group is not None, "MoEAGRSDispatcher requires a non-null process group."
+        return MoEAGRSOriginDispatcher(
+            n_routed_experts=n_routed_experts,
+            process_group=ep_group,
+            training_dtype=training_dtype,
+            generate_dtype=generate_dtype,
+            use_grouped_router=use_grouped_router,
+        )
     else:
         raise ValueError(f"Unknown dispatcher name: {dispatcher}, name must be one of 'deepep' or 'all2all'.")
 

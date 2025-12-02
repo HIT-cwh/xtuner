@@ -289,7 +289,7 @@ def main():
             total_epoch=100,
             work_dir=work_dir,
             seed=0,
-            profile_step=[ ],
+            profile_step=[10, 20, 40],
             intra_layer_micro_batch=intra_layer_micro_batch,
             strict_load=False,
         )
