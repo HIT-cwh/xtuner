@@ -27,6 +27,8 @@ from xtuner.v1.utils.compile import maybe_compile
 from xtuner.v1.utils.device import get_device
 from xtuner.v1.loss import CELossConfig
 import argparse
+from xtuner.v1.float8.config import Float8Config, ScalingGranularity
+from xtuner.v1.datasets.sft_tokenize_fn import OpenaiTokenizeFunctionConfig
 
 QWEN3_MOE_PATH = os.environ["QWEN3_MOE_PATH"]
 ALPACA_PATH = os.environ["ALPACA_PATH"]
@@ -233,11 +235,33 @@ def main():
         torch_compile = False
     else:
         raise NotImplementedError
+    
+    pack_max_length = int(os.environ.get("PACK_MAX_LENGTH"))
+    n_gpus = int(os.environ.get("NGPUS"))
+    intra_layer_micro_batch = int(os.environ.get("INTRA_LAYER_MICRO_BATCH"))
+    ep_size = int(os.environ.get("EP_SIZE"))
+    dispatcher = os.environ.get("DISPATCHER", "deepep")
+    load = os.environ.get("LOAD", "true").lower() == "true"
+    torch_compile = os.environ.get("TORCH_COMPILE", "true").lower() == "true"
+    fp8 = os.environ.get("FP8", "true").lower() == "true"
+    use_grouped_router = os.environ.get("USE_GROUPED_ROUTER", "true").lower() == "true"
+    router_n_groups = int(os.environ.get("ROUTER_N_GROUPS", 8))
 
     moe_cfgs = [
-        (Qwen3MoE235BA22Config(balancing_loss_cfg=BalancingLossConfig(), z_loss_cfg=ZLossConfig()), "ep1"),
+        (
+            Qwen3MoE235BA22Config(
+                ep_size=ep_size,
+                balancing_loss_cfg=BalancingLossConfig(), 
+                float8_cfg=Float8Config(
+                    scaling_granularity_gemm=ScalingGranularity.TILEWISE,
+                    scaling_granularity_grouped_gemm=ScalingGranularity.TILEWISE,
+                ) if fp8 else None,
+                dispatcher=dispatcher if ep_size > 1 else None,
+            ), f"ep{ep_size}"),
     ]
     for moe_cfg, name in moe_cfgs:
+        moe_cfg.router.use_grouped_router = use_grouped_router
+        moe_cfg.router.router_n_groups = router_n_groups
         optim_cfg = AdamWConfig(lr=6e-05)
         lr_cfg = LRConfig(lr_type="cosine", lr_min=1e-6)
         fsdp_cfg = FSDPConfig(
@@ -248,19 +272,21 @@ def main():
         )
         dataset_config = [
             {
-                "dataset": DatasetConfig(name="alpaca", anno_path=ALPACA_PATH, sample_ratio=100),
-                "tokenize_fn": FTDPTokenizeFnConfig(max_length=4096),
+                "dataset": DatasetConfig(name="alpaca", anno_path=ALPACA_PATH, sample_ratio=100.0),
+                "tokenize_fn": OpenaiTokenizeFunctionConfig(max_length=16386, chat_template="qwen3"),
+                # "tokenize_fn": FTDPTokenizeFnConfig(max_length=16386),
             },
         ]
 
         dataloader_config = DataloaderConfig(
-            pack_max_length=65536,
-            num_workers=8,
+            pack_max_length=pack_max_length,
+            num_workers=4,
+            pack_level="hard",
         )
         work_dir = f"{args.work_dir}-{name}"
-        loss_cfg = CELossConfig(mode="chunk", chunk_size=1024, ignore_idx=-100)
+        loss_cfg = CELossConfig(mode="liger", chunk_size=1024, ignore_idx=-100)
         trainer = Trainer(
-            load_from=QWEN3_MOE_PATH,
+            load_from=QWEN3_MOE_PATH if load else None,
             model_cfg=moe_cfg,
             optim_cfg=optim_cfg,
             fsdp_cfg=fsdp_cfg,
@@ -270,12 +296,13 @@ def main():
             loss_cfg=loss_cfg,
             lr_cfg=lr_cfg,
             tokenizer_path=QWEN3_MOE_PATH,
-            global_batch_size=256,
+            global_batch_size=n_gpus * intra_layer_micro_batch,
+            total_epoch=100,
             work_dir=work_dir,
             seed=0,
-            total_epoch=10,
-            profile_step=20,
-            profile_memory=True,
+            profile_step=[10, 20, 40],
+            intra_layer_micro_batch=intra_layer_micro_batch,
+            strict_load=False,
         )
         trainer.fit()
         if dist.get_rank() == 0:
