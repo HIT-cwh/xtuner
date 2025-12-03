@@ -1,4 +1,5 @@
 from typing import Literal
+import os
 
 import torch
 import torch.nn as nn
@@ -34,6 +35,8 @@ class BalancingLoss(nn.Module):
         super().__init__()
         self.loss_weight = balancing_loss_alpha
         self.global_average = balancing_loss_global_average
+        self.cnt = 0
+        self.out_dir = os.environ.get("XTUNER_OUTPUT_DIR", ".")
 
     def forward(self, router_weights, n_routed_experts, num_experts_per_tok):
         if self.loss_weight == 0:
@@ -52,6 +55,15 @@ class BalancingLoss(nn.Module):
             max=num_layers * n_routed_experts,
         )
         tokens_per_expert = tokens_per_expert_flat.view(num_layers, n_routed_experts)  # (nlayers, ne)
+
+        # if dist.get_rank() == 0:
+        #     os.makedirs(self.out_dir, exist_ok=True)
+        # world_size = dist.get_world_size() if dist.is_initialized() else 1
+        # tokens_per_expert_all_gather = tokens_per_expert.new_empty((world_size, ) + tokens_per_expert.shape)
+        # dist.all_gather_into_tensor(tokens_per_expert_all_gather, tokens_per_expert, group=dist.group.WORLD)
+        # if dist.get_rank() == 0:
+        #     torch.save(tokens_per_expert_all_gather, f"{self.out_dir}/step_{self.cnt}.pth")
+        # self.cnt += 1
 
         tokens_per_expert_global = tokens_per_expert.to(router_weights.dtype)  # (nlayers, ne)
         if self.global_average and dist.is_initialized():

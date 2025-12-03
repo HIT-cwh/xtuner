@@ -28,6 +28,8 @@ data_path = os.environ["DATA_PATH"]
 eval_data_path = os.environ["EVAL_DATA_PATH"]
 enable_return_routed_experts = os.environ.get("ENABLE_RETURN_ROUTED_EXPERTS", '0')
 enable_evaluate = True if eval_data_path != "" else False
+ngpus = int(os.environ.get("NODE_COUNT", '1')) * 8
+ROUTER_N_GROUPS = int(os.environ.get("ROUTER_N_GROUPS", '-1'))
 
 # basic settings
 experimental_name = "dapo_math"
@@ -37,17 +39,17 @@ prompt_repeat_k = 16
 rollout_tp_size = 2
 rollout_ep_size = 1
 max_prompt_length = 2048
-max_response_length = 8192
+max_response_length = 20 * 1024
 pack_max_length = 32768
 train_optimizer_steps = 16
-hf_interval = 50
+hf_interval = 3
 enable_initial_evaluate = True
-evaluate_step = 5
+evaluate_step = 3
 
 # 1. resources
 resources = AcceleratorResourcesConfig(
     accelerator="GPU",
-    num_workers=8,
+    num_workers=ngpus,
     num_cpus_per_worker=12,
     cpu_memory_per_worker=16 * 1024**3,  # 16 GB
 )
@@ -63,6 +65,9 @@ rollout_config = RolloutConfig(
     gpu_memory_utilization=0.8,
     context_length = max_response_length + max_prompt_length,
     enable_return_routed_experts=True if enable_return_routed_experts == "1" else False,
+    rollout_timeout=3600,
+    rollout_max_batch_size_per_instance=512,
+    # extra_rollout_config={"lmdeploy_log_level": "INFO"},
 )
 
 # sampling params
@@ -98,8 +103,9 @@ dapomath_judger_config = DapoMathJudgerConfig(
     max_response_len =max_response_length, 
     overlong_buffer_len=4096, 
     overlong_penalty_factor=1.0, 
-    tokenizer=tokenizer)
-judger_cfg = JudgerConfig(reward_judger_configs=[dapomath_judger_config])
+    tokenizer=tokenizer,
+)
+judger_cfg = JudgerConfig(reward_judger_configs=[dapomath_judger_config], judger_timeout=3600)
 
 # 4. dataflow and evaluator
 dataflow_config = DataFlowConfig(
@@ -130,6 +136,8 @@ replay_buffer_cfg = ReplayBufferConfig(
 
 # 5. Train worker
 model_cfg = Qwen3MoE30BA3Config()
+model_cfg.router.use_grouped_router = ROUTER_N_GROUPS != -1
+model_cfg.router.router_n_groups = ROUTER_N_GROUPS if ROUTER_N_GROUPS != -1 else None
 optim_cfg = AdamWConfig(lr=1e-6, betas=(0.9, 0.999), max_grad_norm=1.0, weight_decay=0.1, foreach=False)
 loss_cfg = GRPOLossConfig(
     policy_loss_cfg=dict(

@@ -1,4 +1,7 @@
 set -ex
+
+ray stop --force
+
 # examples of usage:
 # qwen3_8B_grpo_gsm8k training: 
 # bash examples/v1/scripts/run_rl.sh examples/v1/config/rl_qwen3_8B_grpo.py "sglang" $MODEL_PATH $DATA_PATH $EVAL_DATA_PATH
@@ -11,7 +14,8 @@ MODEL_PATH=$3
 DATA_PATH=$4
 EVAL_DATA_PATH=${5:-""}
 
-export PYTHONPATH=$(pwd):$PYTHONPATH
+export PYTHONPATH=/mnt/shared-storage-user/caoweihan/projects/xtuner_251020:/mnt/shared-storage-user/caoweihan/projects/lmdeploy:$PYTHONPATH
+export ENABLE_RETURN_ROUTED_EXPERTS=1
 
 # ray 环境变量
 export MASTER_PORT=6000
@@ -54,7 +58,7 @@ current_time=$(date "+%m%d%H")
 # 取模型路径的最后一级作为model_name，取数据路径的倒数第二级作为data_name
 model_dir_name=$(basename "$MODEL_PATH")
 data_dir_name=$(basename "$(dirname "$DATA_PATH")")
-export WORK_DIR="work_dirs/${model_dir_name}_${data_dir_name}_${infer_backend_lower}"
+# export WORK_DIR="work_dirs/${model_dir_name}_${data_dir_name}_${infer_backend_lower}"
 
 
 # 2. Launch Ray cluster

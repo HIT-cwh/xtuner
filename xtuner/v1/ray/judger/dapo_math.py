@@ -6,6 +6,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from .native import NativeJudger
 
 
+import os
+FIX_EVAL = os.environ.get("FIX_EVAL", "1") == "1"
+
+
 # Adapted from https://github.com/volcengine/verl/blob/main/verl/utils/reward_score/math_dapo.py
 
 
@@ -154,7 +158,7 @@ def normalize_final_answer(final_answer: str) -> str:
     return final_answer.strip()
 
 
-def is_correct_minerva(
+def is_correct_minerva1(
     solution_str: str, gt: str, gt_need_extract: bool = False, answer_pattern: str = r"(?i)Answer\s*:\s*([^\n]+)"
 ) -> tuple[bool, str]:
     """Check if the solution is correct according to Minerva criteria.
@@ -180,6 +184,29 @@ def is_correct_minerva(
         gt = normalize_final_answer(gt)
 
     return (pred == gt), pred
+
+
+def is_correct_minerva(
+    solution_str: str, gt: str, gt_need_extract: bool = False, answer_pattern: str = r"(?i)Answer\s*:\s*([^\n]+)"
+) -> tuple[bool, str]:
+    """Check if the solution is correct according to Minerva criteria.
+
+    Args:
+        solution_str: The solution string to check
+        gt: The ground truth answer
+        gt_need_extract: Whether the ground truth needs extraction
+        answer_pattern: Regex pattern to extract the answer
+
+    Returns:
+        Tuple of (is_correct, normalized_prediction)
+    """
+    solution_str_cur = solution_str[-40:]
+    match = re.search(r"\\boxed\{(\d+)\}", solution_str_cur)
+    if match:
+        extracted_answer = match.group(1)
+        return (extracted_answer == gt), extracted_answer
+    else:
+        return is_correct_minerva1(solution_str, gt, gt_need_extract, answer_pattern)
 
 
 def is_correct_strict_box(
@@ -228,7 +255,10 @@ def verify(
         correct, pred = is_correct_strict_box(solution_str, answer, pause_tokens_index)
         return correct == 1, pred  # type: ignore[arg-type]
 
-    correct, pred = is_correct_minerva(solution_str, answer)
+    if FIX_EVAL:
+        correct, pred = is_correct_minerva(solution_str, answer)
+    else:
+        correct, pred = is_correct_minerva1(solution_str, answer)
     return correct, pred  # type: ignore[arg-type]
 
 
