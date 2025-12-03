@@ -169,6 +169,8 @@ class _AsyncDispatch(Function):
             combined_grad_topk_weights = combined_grad_topk_weights.view(world_size, -1)
             combined_grad_topk_weights = combined_grad_topk_weights.T.contiguous()
 
+            grad_topk_weights.record_stream(ctx.comm_stream)
+            combined_grad_topk_weights.record_stream(ctx.comm_stream)
             if ctx.backward_finished_event is not None:
                 ctx.backward_finished_event.record(ctx.comm_stream)
         return combined_grad_output, None, combined_grad_topk_weights, None, None, None, None, None, None
