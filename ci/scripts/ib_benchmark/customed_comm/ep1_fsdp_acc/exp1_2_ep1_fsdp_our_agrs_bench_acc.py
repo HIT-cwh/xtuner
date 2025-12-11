@@ -31,8 +31,12 @@ CHECKPOINT_INTERVAL = 2000
 # WORK_DIR = "..."  # 需设置
 # dataset and dataloader config
 HF_MODEL_PATH = "/mnt/shared-storage-user/large-model-center-share-weights/hf_hub/models--Qwen--Qwen3-30B-A3B-Base/snapshots/89e5e822ba31507f5f79dc3422c7c5345c422737/"
-CACHE_DIR = "./cache_fsdp_1node"
-WORK_DIR = "./work_dirs/exp1_2_ep1_fsdp_nccl_agrs_bench_acc"
+CACHE_DIR = "./cache_ep1_fsdp_1node"
+
+import os
+scale = int(os.getenv("SCALE_RS_IN_FSDP", 0))
+barrier = int(os.getenv("BARRIER_FSDP_ON_COMP", 0))
+WORK_DIR = f"./work_dirs/exp1_2_ep1_fsdp_our_acc_scale{scale}_barrier{barrier}"
 
 
 dataset_config = [
@@ -71,13 +75,14 @@ trainer = TrainerConfig(
     dataloader_cfg=dataloader_config,
     lr_cfg=lr_cfg,
     fsdp_cfg=fsdp_cfg,
-    loss_cfg=CELossConfig(mode="chunk", chunk_size=1024),
+    loss_cfg=CELossConfig(mode="liger", chunk_size=1024),
     global_batch_size=GLOBAL_BS,
     sp_size=SP_SIZE,
     intra_layer_micro_batch=INTRA_LAYER_MICRO_BATCH,
     total_epoch=1,
     load_from=HF_MODEL_PATH,
     seed=42,
+    profile_step=[5],
     checkpoint_interval=CHECKPOINT_INTERVAL,
     hf_interval=CHECKPOINT_INTERVAL,
     work_dir=WORK_DIR,

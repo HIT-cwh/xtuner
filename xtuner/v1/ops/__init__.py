@@ -7,6 +7,8 @@ from .act_fn import get_act_fn
 from .attn_imp import attn_impl_mapping
 from .flash_attn import flash_attn_varlen_func
 from .moe import group_gemm, permute, unpermute
+from .moe import _permute, _unpermute, _unpermute_inplace, _unpermute_bwd
+
 from .rms_norm import rms_norm
 from .rotary_emb import get_apply_rotary_emb
 from .tensor_parallel import attn_column_parallel, attn_row_parallel
@@ -29,7 +31,7 @@ else:
 
 
 def __getattr__(name: str):
-    if name in ["permute", "unpermute", "grouped_gemm"]:
+    if name in ["permute", "unpermute", "grouped_gemm", "unpermute_inplace"]:
         # TODO: (yehaochen) replace install url
         raise ImportError(
             f"{name} is not available, please install `grouped_gemm` from https://github.com/fanshiqing/grouped_gemm"
