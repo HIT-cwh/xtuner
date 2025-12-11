@@ -12,16 +12,16 @@ from xtuner.v1.datasets.sft_tokenize_fn import OpenaiTokenizeFunctionConfig
 
 # model config
 
-EP_SIZE = 1
+EP_SIZE = 8
 SP_SIZE = 1
 
 
-INTRA_LAYER_MICRO_BATCH = 1
+INTRA_LAYER_MICRO_BATCH = 2
 SEED = 1024
 LR = 8e-5
 LR_MIN = 8e-6
-SEQ_LEN = 65536
-GLOBAL_BS = 128
+SEQ_LEN = 32768
+GLOBAL_BS = 256
 TOTAL_EPOCH = 1
 
 CHECKPOINT_INTERVAL = 2000
@@ -31,8 +31,8 @@ CHECKPOINT_INTERVAL = 2000
 # WORK_DIR = "..."  # 需设置
 # dataset and dataloader config
 HF_MODEL_PATH = "/mnt/shared-storage-user/large-model-center-share-weights/hf_hub/models--Qwen--Qwen3-30B-A3B-Base/snapshots/89e5e822ba31507f5f79dc3422c7c5345c422737/"
-CACHE_DIR = "./cache_fsdp_1node"
-WORK_DIR = "./work_dirs/exp1_2_ep1_fsdp_nccl_agrs_bench_acc"
+CACHE_DIR = "./cache_ep8"
+WORK_DIR = "./work_dirs/ib_benchmark/exp2_2_ep8_grouped_router_our_agrs_bench_acc"
 
 
 dataset_config = [
@@ -63,6 +63,9 @@ fsdp_cfg = FSDPConfig(
 )
 model_cfg = get_model_config_from_hf(HF_MODEL_PATH)
 model_cfg.ep_size = EP_SIZE
+model_cfg.dispatcher = "agrs_custom"
+model_cfg.router.use_grouped_router = True
+model_cfg.router.router_n_groups = 8
 # trainer config
 trainer = TrainerConfig(
     model_cfg=model_cfg,
@@ -71,13 +74,14 @@ trainer = TrainerConfig(
     dataloader_cfg=dataloader_config,
     lr_cfg=lr_cfg,
     fsdp_cfg=fsdp_cfg,
-    loss_cfg=CELossConfig(mode="chunk", chunk_size=1024),
+    loss_cfg=CELossConfig(mode="liger", chunk_size=1024),
     global_batch_size=GLOBAL_BS,
     sp_size=SP_SIZE,
     intra_layer_micro_batch=INTRA_LAYER_MICRO_BATCH,
     total_epoch=1,
     load_from=HF_MODEL_PATH,
     seed=42,
+    profile_step=1,
     checkpoint_interval=CHECKPOINT_INTERVAL,
     hf_interval=CHECKPOINT_INTERVAL,
     work_dir=WORK_DIR,

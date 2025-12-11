@@ -27,16 +27,25 @@ export LD_LIBRARY_PATH=$NVSHMEM_HOME/lib:$LD_LIBRARY_PATH
 export PATH=$NVSHMEM_HOME/bin:$PATH
 
 export NCCL_MAX_CTAS=24 # We need to control the max SM used by nccl
-export DISTRIBUTED_COMMUNICATION_SM=24
+export DISTRIBUTED_COMMUNICATION_SM=8
+export DISPATCHER=agrs_custom # Change dispatcher to customed agrs
+export XTUNER_ENABLE_CUSTOM_COMMUNICATION=1
+export SYMM_BUF_SIZE=0 # 4GB
+export USE_CUSTOM_AG_IN_DISPATCHER=1 # 使用自定义 All gather
+export USE_CUSTOM_RS_IN_DISPATCHER=1 # 使用自定义 Reduce scatter
+export GRID_IB_AG=2
+export GRID_IB_RS=4
 export PYTHONPATH=$PYTHONPATH:/mnt/shared-storage-user/llmrazor-share/data/suzhongling/environment/ib_wrapper/local/lib/python3.12/dist-packages/ib_wrapper-2.0.0-py3.12-linux-x86_64.egg/
 export PYTHONPATH=$PYTHONPATH:/mnt/shared-storage-user/suzhongling/AdaptiveGEMM/
+export PYTHONPATH=$PYTHONPATH:/mnt/shared-storage-user/suzhongling/GroupedGEMM/local/lib/python3.12/dist-packages/grouped_gemm-1.1.4-py3.12-linux-x86_64.egg
 export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6:$LD_PRELOAD
 
+git config --global --add safe.directory /mnt/shared-storage-user/suzhongling/xtuner_1204
 
 torchrun --nproc-per-node=8  \
     --master_addr=${MASTER_ADDR} \
     --master_port=6000 \
     --nnodes=${NODE_COUNT} \
     --node_rank=${NODE_RANK} \
-    xtuner/v1/train/cli/sft.py \
-    --config ci/scripts/ib_benchmark/exp1_2_ep1_fsdp_nccl_agrs_bench_acc.py
+    xtuner/v1/train/cli/sft_ib.py \
+    --config ci/scripts/ib_benchmark/customed_comm/ep8_acc/exp2_2_ep8_grouped_router_our_agrs_bench_acc.py
