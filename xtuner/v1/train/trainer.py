@@ -61,6 +61,8 @@ DEVICE_MODULE = get_torch_device_module()
 
 logger = get_logger()
 
+VARLEN_4096 = os.environ.get("XTUNER_VARLEN_4096", "0") == "1"
+
 
 class GitInfo(TypedDict):
     commit: str | None
@@ -588,6 +590,23 @@ class Trainer:
 
         setup_prober_list(self.exp_dir, self._profile_step, self._engine.model, prober_list)
 
+        pack_max_length = self._dataloader_config.pack_max_length
+        if VARLEN_4096:
+            n = pack_max_length // 4096
+            seq_len = torch.tensor([4096] * n, dtype=torch.int32)
+            self.cu_seqlens = torch.zeros(n + 1, dtype=torch.int32)
+            self.cu_seqlens[1:] = torch.cumsum(seq_len, dim=0)
+
+        if int(os.getenv("XTUNER_ENABLE_CUSTOM_COMMUNICATION", 0)):
+            print("Using custom communication library")
+            import ib_wrapper
+            group = dist.new_group(list(range(dist.get_world_size())))
+            buffer = ib_wrapper.Buffer(
+                group, 
+                master_rank=dist.get_world_size() - 1, 
+                explicitly_destroy=True
+            )
+
     @classmethod
     def from_config(cls, config: TrainerConfig) -> Self:
         """Create a Trainer instance from a TrainerConfig.
@@ -657,6 +676,12 @@ class Trainer:
 
             seq_ctx_list: list[SequenceContext] = []
             loss_ctx_input_list: list[CELossContextInputItem] = []
+            if VARLEN_4096:
+                for data in data_batch:
+                    data["seq_ctx"].max_length_q.copy_(4096)
+                    data["seq_ctx"].max_length_k.copy_(4096)
+                    data["seq_ctx"].cu_seq_lens_q = self.cu_seqlens
+                    data["seq_ctx"].cu_seq_lens_k = self.cu_seqlens
             for data in data_batch:
                 seq_ctx = data["seq_ctx"].to(DEVICE)
                 loss_ctx_input = CELossContextInputItem(shifted_labels=data["shifted_labels"]).to(DEVICE)
