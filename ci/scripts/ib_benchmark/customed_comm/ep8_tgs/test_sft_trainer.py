@@ -307,21 +307,21 @@ def main():
             work_dir=work_dir,
             seed=0,
             # profile_memory=True,
-            profile_step=[1, 20, 40],
+            profile_step=[20, 40],
             intra_layer_micro_batch=intra_layer_micro_batch,
             strict_load=False,
             hf_interval=hf_interval,
         )
 
-        if int(os.getenv("XTUNER_ENABLE_CUSTOM_COMMUNICATION", 0)):
-            print("Using custom communication library")
-            import ib_wrapper
-            group = dist.new_group(list(range(dist.get_world_size())))
-            buffer = ib_wrapper.Buffer(
-                group, 
-                master_rank=dist.get_world_size() - 1, 
-                explicitly_destroy=True
-            )
+        # if int(os.getenv("XTUNER_ENABLE_CUSTOM_COMMUNICATION", 0)):
+        #     print("Using custom communication library")
+        #     import ib_wrapper
+        #     group = dist.new_group(list(range(dist.get_world_size())))
+        #     buffer = ib_wrapper.Buffer(
+        #         group, 
+        #         master_rank=dist.get_world_size() - 1, 
+        #         explicitly_destroy=True
+        #     )
             
         trainer.fit()
         if dist.get_rank() == 0:

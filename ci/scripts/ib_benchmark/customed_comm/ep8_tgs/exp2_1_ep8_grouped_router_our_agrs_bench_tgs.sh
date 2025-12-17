@@ -1,6 +1,6 @@
 set -ex
 
-cd /mnt/shared-storage-user/suzhongling/xtuner_1204
+cd /mnt/shared-storage-user/caoweihan/projects/xtuner_251020
 
 export PATH=/usr/local/nvidia/bin/:$PATH
 export LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:$LD_LIBRARY_PATH
@@ -68,15 +68,15 @@ export BARRIER_DISPATCHER_ON_COMP=0 # 在 Dispatcher compute 流中同步
 export GRID_IB_AG=2
 export GRID_IB_RS=2
 
-export PYTHONPATH=$PYTHONPATH:/mnt/shared-storage-user/llmrazor-share/data/suzhongling/environment/ib_wrapper/local/lib/python3.12/dist-packages/ib_wrapper-2.0.0-py3.12-linux-x86_64.egg/
-export PYTHONPATH=$PYTHONPATH:/mnt/shared-storage-user/suzhongling/AdaptiveGEMM/
-export PYTHONPATH=$PYTHONPATH:/mnt/shared-storage-user/suzhongling/GroupedGEMM/local/lib/python3.12/dist-packages/grouped_gemm-1.1.4-py3.12-linux-x86_64.egg
+export PYTHONPATH=/mnt/shared-storage-user/llmrazor-share/data/suzhongling/environment/ib_wrapper/local/lib/python3.12/dist-packages/ib_wrapper-2.0.0-py3.12-linux-x86_64.egg/:$PYTHONPATH
+export PYTHONPATH=/mnt/shared-storage-user/suzhongling/AdaptiveGEMM/:$PYTHONPATH
+export PYTHONPATH=/mnt/shared-storage-user/suzhongling/GroupedGEMM/local/lib/python3.12/dist-packages/grouped_gemm-1.1.4-py3.12-linux-x86_64.egg:$PYTHONPATH
 export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6:$LD_PRELOAD
 # cp _fsdp_collectives_custom_comm.py /usr/local/lib/python3.12/dist-packages/torch/distributed/fsdp/_fully_shard/_fsdp_collectives.py
 # cp _fsdp_param_group.py /usr/local/lib/python3.12/dist-packages/torch/distributed/fsdp/_fully_shard/_fsdp_param_group.py
 
 
-git config --global --add safe.directory /mnt/shared-storage-user/suzhongling/xtuner_1204
+# git config --global --add safe.directory /mnt/shared-storage-user/suzhongling/xtuner_1204
 
 torchrun --nproc-per-node=8  \
     --master_addr=${MASTER_ADDR} \
@@ -84,4 +84,4 @@ torchrun --nproc-per-node=8  \
     --nnodes=${NODE_COUNT} \
     --node_rank=${NODE_RANK} \
     ci/scripts/ib_benchmark/customed_comm/ep8_tgs/test_sft_trainer.py \
-    work_dirs/exp2_1_ep8_grouped_router_our_agrs_bench_tgs
+    work_dirs/ib_benchmark/exp2_1_ep8_grouped_router_nccl_agrs_bench_tgs_ib
