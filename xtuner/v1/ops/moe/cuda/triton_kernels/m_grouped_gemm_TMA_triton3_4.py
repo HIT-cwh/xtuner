@@ -7,6 +7,10 @@ import triton.language as tl
 from torch import Tensor
 
 
+import os
+DISTRIBUTED_COMMUNICATION_SM = int(os.environ.get("DISTRIBUTED_COMMUNICATION_SM", 24))
+
+
 def get_cuda_autotune_config():
     return [
         triton.Config({"BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 6}, num_stages=3, num_warps=8),
@@ -280,7 +284,7 @@ def m_grouped_gemm(
     group_end = size_per_group.cumsum(0) - size_per_group + size_per_group
     group_start = size_per_group.cumsum(0) - size_per_group
 
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count if numSM <= 0 else numSM
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count - DISTRIBUTED_COMMUNICATION_SM
 
     dtype_mapping = {torch.bfloat16: 0, torch.float16: 1}
     dtype_a = dtype_mapping.get(A.dtype, -1)

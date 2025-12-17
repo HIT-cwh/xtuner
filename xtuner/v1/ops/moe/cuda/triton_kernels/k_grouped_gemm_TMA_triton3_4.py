@@ -7,6 +7,10 @@ import triton.language as tl
 from torch import Tensor
 
 
+import os
+DISTRIBUTED_COMMUNICATION_SM = int(os.environ.get("DISTRIBUTED_COMMUNICATION_SM", 24))
+
+
 def get_cuda_autotune_config():
     return [
         triton.Config({"BLOCK_M": 256, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 12}, num_stages=5, num_warps=8),
@@ -160,7 +164,7 @@ def k_grouped_gemm(A: Tensor, B: Tensor, size_per_group: torch.Tensor) -> Tensor
     assert dtype_b >= 0, f"data type {B.dtype} not supported"
     assert dtype_c >= 0, f"data type {C.dtype} not supported"
 
-    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count - DISTRIBUTED_COMMUNICATION_SM
 
     def grid(META):
         # assert N % META["BLOCK_N"] == 0, "Only support when N is a multiple of BLOCK_N"
