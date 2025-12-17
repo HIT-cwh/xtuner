@@ -375,15 +375,53 @@ use_custom_rs = int(os.getenv("USE_CUSTOM_RS_IN_FSDP", 0))
 use_custom_ag = int(os.getenv("USE_CUSTOM_AG_IN_FSDP", 0))
 
 
-num_ag_buffers = 2 if use_custom_ag else 0
-num_rs_buffers = 1 if use_custom_rs else 0
+# NOTE: runtime-init globals (lazy)
+ag_symm: Optional["SymmBufferManager"] = None
+rs_symm: Optional["SymmBufferManager"] = None
+ag_manager: Optional["AllGatherIBManager"] = None
+rs_manager: Optional["ReduceScatterIBManager"] = None
 
-ag_symm = SymmBufferManager(int(os.getenv("SYMM_BUF_SIZE", 0)), num_buffers=num_ag_buffers)
-rs_symm = SymmBufferManager(int(os.getenv("SYMM_BUF_SIZE", 0)), num_buffers=num_rs_buffers)
+def _get_num_ag_buffers() -> int:
+    return 2 if int(os.getenv("USE_CUSTOM_AG_IN_FSDP", 0)) else 0
 
-# symm_mgr = SymmBufferManager(int(os.getenv("SYMM_BUF_SIZE", 0)), num_buffers=num_buffers)
-ag_manager = AllGatherIBManager(num_buffers=num_ag_buffers, use_custom_ag=use_custom_ag)
-rs_manager = ReduceScatterIBManager(num_buffers=num_rs_buffers, use_custom_rs=use_custom_rs)
+def _get_num_rs_buffers() -> int:
+    return 1 if int(os.getenv("USE_CUSTOM_RS_IN_FSDP", 0)) else 0
+
+def ensure_runtime_managers(device: Optional[torch.device] = None) -> None:
+    """
+    Lazily initialize global comm managers at runtime (first use).
+    Safe to call multiple times.
+    """
+    global use_custom_ag, use_custom_rs
+    global ag_symm, rs_symm, ag_manager, rs_manager
+
+    # Refresh flags from env at runtime (optional but usually desired)
+    use_custom_ag = int(os.getenv("USE_CUSTOM_AG_IN_FSDP", 0))
+    use_custom_rs = int(os.getenv("USE_CUSTOM_RS_IN_FSDP", 0))
+
+    num_ag_buffers = _get_num_ag_buffers()
+    num_rs_buffers = _get_num_rs_buffers()
+
+    symm_default = int(os.getenv("SYMM_BUF_SIZE", 0))
+
+    # Only create SymmBufferManager if it might be used; keep None otherwise
+    if ag_symm is None and num_ag_buffers > 0 and (use_custom_ag or use_custom_rs):
+        ag_symm = SymmBufferManager(symm_default, num_buffers=num_ag_buffers)
+    if rs_symm is None and num_rs_buffers > 0 and (use_custom_rs):
+        rs_symm = SymmBufferManager(symm_default, num_buffers=num_rs_buffers)
+
+    if ag_manager is None:
+        ag_manager = AllGatherIBManager(num_buffers=max(num_ag_buffers, 1), use_custom_ag=use_custom_ag)
+    else:
+        ag_manager.use_custom_ag = use_custom_ag
+        ag_manager.num_buffers = max(num_ag_buffers, 1)
+
+    if rs_manager is None:
+        rs_manager = ReduceScatterIBManager(num_buffers=max(num_rs_buffers, 1), use_custom_rs=use_custom_rs)
+    else:
+        rs_manager.use_custom_rs = use_custom_rs
+        rs_manager.num_buffers = max(num_rs_buffers, 1)
+
 
 class AllGatherResult(NamedTuple):
     all_gather_output: torch.Tensor
@@ -446,7 +484,9 @@ def all_gather_copy_in_cuda(
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     global ag_symm
-    if (use_custom_ag or use_custom_rs) and world_size == dist.get_world_size():
+    ensure_runtime_managers(device)
+
+    if (use_custom_ag or use_custom_rs) and world_size == dist.get_world_size() and ag_symm is not None:
         recv_bytes = all_gather_input_numel * world_size * all_gather_inputs[0].element_size()
         send_bytes = recv_bytes // world_size
         recv_bytes_aligned = (send_bytes + 127) // 128 * 128 * world_size
@@ -511,6 +551,8 @@ def foreach_all_gather(
     all_gather_stream: torch.Stream,
     device: torch.device,
 ) -> Optional[AllGatherResult]:
+    ensure_runtime_managers(device)
+
     world_size, rank = group.size(), group.rank()
     device_handle = _get_device_handle(device.type)
     
@@ -546,7 +588,7 @@ def foreach_all_gather(
 
     # Use the global dictionary for caching ibgdaAllgather objects
     global ag_manager, use_custom_ag
-    if use_custom_ag:
+    if use_custom_ag and ag_manager is not None:
         ag_manager.get_allgather_objects(
             send_bytes=send_bytes,
             group_size=group.size(),
@@ -562,7 +604,11 @@ def foreach_all_gather(
         all_gather_stream.wait_event(rs_event)
     # Execute operations on the all_gather_stream
     with device_handle.stream(all_gather_stream):
-        if use_custom_ag and (group.size() == dist.get_world_size() or group.size() == dist.get_world_size() // torch.cuda.device_count()):
+        if (
+            use_custom_ag
+            and ag_manager is not None
+            and (group.size() == dist.get_world_size() or group.size() == dist.get_world_size() // torch.cuda.device_count())
+        ):
             ag_manager.execute_allgather(
                 send_bytes=send_bytes,
                 group_size=group.size(),
@@ -768,6 +814,8 @@ def foreach_reduce(
     ``unsharded_grads`` owns the references to the gradients computed by
     autograd, so clearing the list frees the gradients.
     """
+    ensure_runtime_managers(device)
+
     grad_dtypes = {grad.dtype for grad in unsharded_grads}
     if len(grad_dtypes) != 1:
         # Check this at runtime since it could be a real runtime error if e.g.
@@ -803,14 +851,14 @@ def foreach_reduce(
 
     global rs_manager, use_custom_rs, rs_symm
     # Get reduce-scatter objects
-    rs_manager.get_reducescatter_objects(
-        # recv_bytes_aligned=recv_bytes_aligned,
-        recv_bytes_aligned=recv_bytes,
-        group_size=reduce_scatter_group.size(),
-        world_size=dist.get_world_size(),
-        device_count=torch.cuda.device_count(),
-        reduce_scatter_stream=reduce_scatter_stream
-    )
+    if rs_manager is not None:
+        rs_manager.get_reducescatter_objects(
+            recv_bytes_aligned=recv_bytes,
+            group_size=reduce_scatter_group.size(),
+            world_size=dist.get_world_size(),
+            device_count=torch.cuda.device_count(),
+            reduce_scatter_stream=reduce_scatter_stream
+        )
 
 
     # Custom op only support when group is of world size
@@ -820,11 +868,10 @@ def foreach_reduce(
 
     is_world_group = reduce_scatter_group.size() == dist.get_world_size()
     is_vertical_group = reduce_scatter_group.size() == dist.get_world_size()// torch.cuda.device_count()
-    if is_world_group and use_custom_rs:
+    if is_world_group and use_custom_rs and rs_symm is not None:
         symm_buf = rs_symm.get_buffer(bytes=send_bytes_aligned, device=device)
         reduce_scatter_input = symm_buf.view(reduce_dtype)[ : reduce_scatter_input_numel]
         reduce_scatter_input_aligned = reduce_scatter_input
-
     else:
         reduce_scatter_input = torch.empty(
             (reduce_scatter_input_numel,), dtype=reduce_dtype, device=device
@@ -887,38 +934,34 @@ def foreach_reduce(
             else:
                 reduce_scatter_reduce_op = ReduceOp.SUM
             
-        if is_world_group and use_custom_rs:
+        if is_world_group and use_custom_rs and rs_manager is not None:
             reduce_output = rs_manager.execute_reducescatter(
-                    # recv_bytes_aligned=recv_bytes_aligned,
-                    recv_bytes_aligned=recv_bytes,
-                    group_size=reduce_scatter_group.size(),
-                    world_size=dist.get_world_size(),
-                    reduce_scatter_input=reduce_scatter_input,
-                    reduce_scatter_input_aligned=reduce_scatter_input_aligned,
-                    reduce_scatter_group=reduce_scatter_group,
-                    reduce_scatter_stream=reduce_scatter_stream,
-                    reduce_scatter_reduce_op=reduce_scatter_reduce_op,
-                    recv_bytes=recv_bytes,
-                    reduce_scatter_output_numel=reduce_scatter_output_numel,
-                    device=device
-                )
-            
-            # rs_manager.rdc_scale[recv_bytes_aligned] = rdc_scale[0]
-        elif is_vertical_group and use_custom_rs:
+                recv_bytes_aligned=recv_bytes,
+                group_size=reduce_scatter_group.size(),
+                world_size=dist.get_world_size(),
+                reduce_scatter_input=reduce_scatter_input,
+                reduce_scatter_input_aligned=reduce_scatter_input_aligned,
+                reduce_scatter_group=reduce_scatter_group,
+                reduce_scatter_stream=reduce_scatter_stream,
+                reduce_scatter_reduce_op=reduce_scatter_reduce_op,
+                recv_bytes=recv_bytes,
+                reduce_scatter_output_numel=reduce_scatter_output_numel,
+                device=device
+            )
+        elif is_vertical_group and use_custom_rs and rs_manager is not None:
             reduce_output = rs_manager.execute_reducescatter(
-                    recv_bytes_aligned=recv_bytes,
-                    group_size=reduce_scatter_group.size(),
-                    world_size=dist.get_world_size(),
-                    reduce_scatter_input=reduce_scatter_input,
-                    reduce_scatter_input_aligned=reduce_scatter_input_aligned,
-                    reduce_scatter_group=reduce_scatter_group,
-                    reduce_scatter_stream=reduce_scatter_stream,
-                    reduce_scatter_reduce_op=reduce_scatter_reduce_op,
-                    recv_bytes=recv_bytes,
-                    reduce_scatter_output_numel=reduce_scatter_output_numel,
-                    device=device
-                )
-
+                recv_bytes_aligned=recv_bytes,
+                group_size=reduce_scatter_group.size(),
+                world_size=dist.get_world_size(),
+                reduce_scatter_input=reduce_scatter_input,
+                reduce_scatter_input_aligned=reduce_scatter_input_aligned,
+                reduce_scatter_group=reduce_scatter_group,
+                reduce_scatter_stream=reduce_scatter_stream,
+                reduce_scatter_reduce_op=reduce_scatter_reduce_op,
+                recv_bytes=recv_bytes,
+                reduce_scatter_output_numel=reduce_scatter_output_numel,
+                device=device
+            )
         else:
             reduce_output = reduce_scatter_input.new_empty((reduce_scatter_output_numel,))
             dist.reduce_scatter_tensor(
