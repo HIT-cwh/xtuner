@@ -42,9 +42,9 @@ class MHAConfig(BaseModel):
     attn_impl: Literal["flash_attention", "flex_attention", "eager_attention"] = "flash_attention"
 
     def model_post_init(self, _):
-        if not is_installed("flash-attn") and self.attn_impl == "flash_attention" and get_device() == "cuda":
-            logger.warning("flash-attn is not installed, using `flex_attention` instead.")
-            self.attn_impl = "flex_attention"
+        # if not is_installed("flash-attn") and self.attn_impl == "flash_attention" and get_device() == "cuda":
+        #     logger.warning("flash-attn is not installed, using `flex_attention` instead.")
+        #     self.attn_impl = "flex_attention"
         return self
 
     def build(
