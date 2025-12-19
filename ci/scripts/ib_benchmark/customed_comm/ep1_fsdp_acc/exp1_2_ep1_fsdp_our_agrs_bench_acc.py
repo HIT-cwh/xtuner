@@ -36,7 +36,9 @@ CACHE_DIR = "./cache_ep1_fsdp_1node"
 import os
 scale = int(os.getenv("SCALE_RS_IN_FSDP", 0))
 barrier = int(os.getenv("BARRIER_FSDP_ON_COMP", 0))
-WORK_DIR = f"./work_dirs/exp1_2_ep1_fsdp_our_acc_scale{scale}_barrier{barrier}"
+selectsm = int(os.getenv("SELECT_COMM_SM_IN_FSDP", 0))
+
+WORK_DIR = f"./work_dirs/exp1_2_ep1_fsdp_our_acc_scale{scale}_barrier{barrier}_selectsm{selectsm}"
 
 
 dataset_config = [

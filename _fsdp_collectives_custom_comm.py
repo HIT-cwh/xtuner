@@ -188,17 +188,21 @@ class SymmBufferManager:
         """Destructor to ensure proper resource cleanup."""
         self.release()
 
+
 class AllGatherIBManager:
     """
     Manager for ibgdaAllgather objects with double buffering support.
     Handles creation, caching, and rotation of communication buffers.
     """
     
-    def __init__(self, num_buffers: int = 2, use_custom_ag: bool = False):
+    def __init__(self, num_buffers: int = 2, use_custom_ag: bool = False, select_sm: bool = False):
         self.num_buffers = num_buffers
         self.comm_buf_iter = 0
         self.use_custom_ag = use_custom_ag
         self.ag_ib_dict: dict[int, list] = {}
+        self.select_sm = int(os.getenv("SELECT_COMM_SM_IN_FSDP", 0))
+
+        self.comm_sm_list = None
     
     def get_allgather_objects(self, send_bytes: int, group_size: int, world_size: int, 
                             device_count: int, all_gather_stream, mode: int = 0):
@@ -215,6 +219,8 @@ class AllGatherIBManager:
         """
         if send_bytes not in self.ag_ib_dict and self.use_custom_ag:
             torch.cuda.synchronize()
+            if self.comm_sm_list == None:
+                self.comm_sm_list, _ = ib_wrapper.init_comm_sm()
             # Determine if this is a full world or EP group
             is_full_world = group_size == world_size
             is_ep_group = group_size == world_size // device_count
@@ -234,7 +240,9 @@ class AllGatherIBManager:
                 for _ in range(self.num_buffers):
                     AGs.append(ibgdaAllgather(
                         send_bytes, torch.distributed.group.WORLD, all_gather_stream,
-                        mode=0, barrier_all=True, vertical_group_ag=vertical_group_ag
+                        mode=0, barrier_all=True, vertical_group_ag=vertical_group_ag,
+                        comm_sm_list = self.comm_sm_list,
+                        select_sm = self.select_sm
                     ))
             torch.cuda.synchronize()   
             self.ag_ib_dict[send_bytes] = AGs
@@ -279,9 +287,11 @@ class ReduceScatterIBManager:
         self.use_custom_rs = use_custom_rs
         self.rs_ib_dict: dict[int, list] = {}
         self.rdc_scale: dict[int, torch.Tensor] = {}
-        self.copy_stream = torch.cuda.Stream()
         self.copy_event_prev : torch.cuda.Event = None
         self.copy_event : torch.cuda.Event = None
+        self.select_sm = int(os.getenv("SELECT_COMM_SM_IN_FSDP", 0))
+        
+        self.comm_sm_list = None
     
     def get_reducescatter_objects(self, recv_bytes_aligned: int, group_size: int, 
                                 world_size: int, device_count: int, reduce_scatter_stream):
@@ -297,6 +307,9 @@ class ReduceScatterIBManager:
         """
         if recv_bytes_aligned not in self.rs_ib_dict and self.use_custom_rs:
             torch.cuda.synchronize()
+            if self.comm_sm_list == None:
+                self.comm_sm_list, _ = ib_wrapper.init_comm_sm()
+
             # Determine group type and configuration
             is_full_world = group_size == world_size
             is_ep_group = group_size == world_size // device_count
@@ -306,7 +319,9 @@ class ReduceScatterIBManager:
                 for _ in range(self.num_buffers):
                     RSs.append(ibReduceScatter(
                         recv_bytes_aligned, torch.distributed.group.WORLD, reduce_scatter_stream,
-                        mode=0, barrier_all=True, vertical_group_rs=False
+                        mode=0, barrier_all=True, vertical_group_rs=False, 
+                        select_sm = self.select_sm,
+                        comm_sm_list = self.comm_sm_list
                     ))
              
             elif is_ep_group:
@@ -381,7 +396,6 @@ num_rs_buffers = 1 if use_custom_rs else 0
 ag_symm = SymmBufferManager(int(os.getenv("SYMM_BUF_SIZE", 0)), num_buffers=num_ag_buffers)
 rs_symm = SymmBufferManager(int(os.getenv("SYMM_BUF_SIZE", 0)), num_buffers=num_rs_buffers)
 
-# symm_mgr = SymmBufferManager(int(os.getenv("SYMM_BUF_SIZE", 0)), num_buffers=num_buffers)
 ag_manager = AllGatherIBManager(num_buffers=num_ag_buffers, use_custom_ag=use_custom_ag)
 rs_manager = ReduceScatterIBManager(num_buffers=num_rs_buffers, use_custom_rs=use_custom_rs)
 
@@ -755,7 +769,7 @@ def foreach_reduce(
     all_reduce_grads: bool,
     partial_reduce_output: Optional[torch.Tensor],  # only used for HSDP
     layer_num: int,
-    reduce_scale: Dict
+    reduce_scale: Dict,
 ) -> Tuple[
     torch.Tensor,
     torch.Event,

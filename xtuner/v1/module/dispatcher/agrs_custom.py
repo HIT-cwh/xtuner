@@ -33,7 +33,6 @@ from .base import (
 import ib_wrapper
 from ib_wrapper import ibReduceScatter
 from ib_wrapper import ibgdaAllgather
-from ib_wrapper import copy_no_cache
 
 @torch._dynamo.disable
 class SymmBufferManager:
@@ -728,7 +727,6 @@ class _AsyncDispatch(Function):
                 # dispatched_hidden_states.copy_(combined_grad_out_symm)
                 # copy_tensor_in_chunks(combined_grad_out_symm, dispatched_hidden_states, chunk_size_gb=0.05)
 
-                # copy_no_cache(src = combined_grad_out_symm, dst = dispatched_hidden_states, stream = comm_stream, gridSize = 4, blockSize = 1024)
                 dispatched_hidden_states = combined_grad_out_symm
                 dispatched_hidden_states = dispatched_hidden_states.view(-1, *hidden_states.shape[1:])
 
@@ -1004,7 +1002,6 @@ class _AsyncCombine(Function):
                 # combined_grad_output.copy_(combined_grad_out_symm)
                 # copy_tensor_in_chunks(combined_grad_out_symm, combined_grad_output, chunk_size_gb=0.05)
 
-                # copy_no_cache(src = combined_grad_out_symm, dst = combined_grad_output, stream = comm_stream, gridSize = 4, blockSize = 1024)
                 combined_grad_output = combined_grad_out_symm
                 combined_grad_output = combined_grad_output.view(-1, *grad_output.shape[1:])
                 

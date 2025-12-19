@@ -27,10 +27,11 @@ export LD_LIBRARY_PATH=$NVSHMEM_HOME/lib:$LD_LIBRARY_PATH
 export PATH=$NVSHMEM_HOME/bin:$PATH
 
 export NCCL_MAX_CTAS=24 # We need to control the max SM used by nccl
-export DISTRIBUTED_COMMUNICATION_SM=8
+export DISTRIBUTED_COMMUNICATION_SM=4
+
 export DISPATCHER=agrs 
 export XTUNER_ENABLE_CUSTOM_COMMUNICATION=1
-export BARRIER_FSDP_ON_COMP=0
+export BARRIER_FSDP_ON_COMP=1
 export SCALE_RS_IN_FSDP=0
 # # Check if either variable is set to 1 (non-zero)
 # if [ "$BARRIER_FSDP_ON_COMP" = "1" ] || [ "$SCALE_RS_IN_FSDP" = "1" ]; then
@@ -44,6 +45,7 @@ export USE_CUSTOM_AG_IN_FSDP=1 # 使用自定义 All gather
 export USE_CUSTOM_RS_IN_FSDP=1 # 使用自定义 Reduce scatter
 export GRID_IB_AG=4
 export GRID_IB_RS=4
+export SELECT_COMM_SM_IN_FSDP=1
 
 export PYTHONPATH=$PYTHONPATH:/mnt/shared-storage-user/llmrazor-share/data/suzhongling/environment/ib_wrapper/local/lib/python3.12/dist-packages/ib_wrapper-2.0.0-py3.12-linux-x86_64.egg/
 export PYTHONPATH=$PYTHONPATH:/mnt/shared-storage-user/suzhongling/AdaptiveGEMM/
