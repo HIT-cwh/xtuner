@@ -31,6 +31,7 @@ export TORCH_COMPILE=true
 export XTUNER_ACTIVATION_OFFLOAD=1
 export FP8=true
 export PACK_MAX_LENGTH=65536
+# export PACK_MAX_LENGTH=4096
 export INTRA_LAYER_MICRO_BATCH=1
 export XTUNER_ROUTER_DEBUG=false
 export USE_GROUPED_ROUTER=false
@@ -52,11 +53,12 @@ export LD_LIBRARY_PATH=$NVSHMEM_HOME/lib:$LD_LIBRARY_PATH
 export PATH=$NVSHMEM_HOME/bin:$PATH
 
 export NCCL_MAX_CTAS=24 # We need to control the max SM used by nccl
-export DISTRIBUTED_COMMUNICATION_SM=8
+export DISTRIBUTED_COMMUNICATION_SM=4
 export DISPATCHER=agrs 
 export XTUNER_ENABLE_CUSTOM_COMMUNICATION=1
-export BARRIER_FSDP_ON_COMP=0
+export BARRIER_FSDP_ON_COMP=1
 export SCALE_RS_IN_FSDP=0
+export SELECT_COMM_SM_IN_FSDP=1
 # # Check if either variable is set to 1 (non-zero)
 # if [ "$BARRIER_FSDP_ON_COMP" = "1" ] || [ "$SCALE_RS_IN_FSDP" = "1" ]; then
 #     export BARRIER_FSDP_ON_COMP=1
@@ -87,4 +89,4 @@ torchrun --nproc-per-node=8  \
     --nnodes=${NODE_COUNT} \
     --node_rank=${NODE_RANK} \
     ci/scripts/ib_benchmark/customed_comm/ep1_fsdp_tgs/test_sft_trainer_235B.py \
-    work_dirs/ib_benchmark/exp1_1_ep1_fsdp_our_agrs_bench_tgs_barrier${BARRIER_FSDP_ON_COMP}_scale${SCALE_RS_IN_FSDP}
+    work_dirs/ib_benchmark/exp1_1_ep1_fsdp_our_agrs_bench_tgs_barrier${BARRIER_FSDP_ON_COMP}_scale${SCALE_RS_IN_FSDP}_selectSM${SELECT_COMM_SM_IN_FSDP}
