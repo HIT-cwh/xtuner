@@ -56,7 +56,7 @@ export NCCL_MAX_CTAS=24 # We need to control the max SM used by nccl
 export DISTRIBUTED_COMMUNICATION_SM=4
 export DISPATCHER=agrs 
 export XTUNER_ENABLE_CUSTOM_COMMUNICATION=1
-export BARRIER_FSDP_ON_COMP=1
+export BARRIER_FSDP_ON_COMP=0
 export SCALE_RS_IN_FSDP=0
 export SELECT_COMM_SM_IN_FSDP=1
 # # Check if either variable is set to 1 (non-zero)
