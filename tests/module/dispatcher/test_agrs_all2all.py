@@ -69,6 +69,103 @@ class TestNoETorchAll2AllDispatcher(DistributedTestBase):
 
         self.assertTrue(torch.allclose(all2all_results["hidden_states"], agrs_results["hidden_states"], atol=1e-2, rtol=1e-2))
 
+        logits_list = [torch.randn(seq_len, num_experts).cuda() for _ in range(2)]
+        router_out_list = [router(logits) for logits in logits_list]
+        hidden_states_list = [torch.rand(seq_len, hidden_size).to(device).to(dtype) for _ in range(2)]
+        all2all_results_list = self._dispatcher_call_micro_batch(
+            dispatcher=all2all_dispatcher,
+            hidden_states_list=hidden_states_list,
+            topk_ids_list=[router_out["topk_ids"] for router_out in router_out_list],
+            topk_weights_list=[router_out["topk_weights"] for router_out in router_out_list],
+        )
+        agrs_results_list = self._dispatcher_call_micro_batch(
+            dispatcher=agrs_dispatcher,
+            hidden_states_list=hidden_states_list,
+            topk_ids_list=[router_out["topk_ids"] for router_out in router_out_list],
+            topk_weights_list=[router_out["topk_weights"] for router_out in router_out_list],
+        )
+        torch.distributed.breakpoint()
+
+    def _dispatcher_call_micro_batch(
+            self,
+            dispatcher: DispacherInterface,
+            hidden_states_list: torch.Tensor,
+            topk_ids_list: torch.Tensor,
+            topk_weights_list: torch.Tensor
+    ):
+        intra_layer_micro_batch = len(hidden_states_list)
+        pre_dispatched_list = []
+        for hidden_states, topk_ids in zip(hidden_states_list, topk_ids_list):
+            pre_dispatched = dispatcher.dispatch_preprocess(
+                hidden_states=hidden_states,
+                topk_ids=topk_ids,
+                async_op=True,
+            )
+            pre_dispatched_list.append(pre_dispatched)
+        
+        dispatched_list = []
+        post_dispatched_list = []
+        experts_out_list = []
+        pre_combined_list = []
+        combined_list = []
+
+        for topk_weights, pre_dispatched in zip(topk_weights_list, pre_dispatched_list):
+            dispatched = dispatcher.dispatch(
+                pre_dispatched=pre_dispatched,
+                topk_weights=topk_weights,
+                async_op=True,
+            )
+            post_dispatched = dispatcher.dispatch_postprocess(
+                pre_dispatched=pre_dispatched,
+                dispatched=dispatched,
+                async_op=True,
+            )
+            experts_results = mock_experts(
+                hidden_states=post_dispatched["hidden_states"],
+                tokens_per_exprts=post_dispatched["tokens_per_expert"],
+            )
+            pre_combined = dispatcher.combine_preprocess(
+                hidden_states=experts_results,
+                pre_dispatched=pre_dispatched,
+                dispatched=dispatched,
+                post_dispatched=post_dispatched,
+                async_op=True,
+            )
+            post_dispatched_list.append(post_dispatched)
+            experts_out_list.append(experts_results)
+            dispatched_list.append(dispatched)
+            pre_combined_list.append(pre_combined)
+
+        for pre_combined, pre_dispatched, dispatched, post_dispatched in zip(
+            pre_combined_list,
+            pre_dispatched_list,
+            dispatched_list,
+            post_dispatched_list,
+        ):
+            combined = dispatcher.combine(
+                pre_combined=pre_combined,
+                pre_dispatched=pre_dispatched,
+                dispatched=dispatched,
+                post_dispatched=post_dispatched,
+                async_op=True,
+            )
+            combined_list.append(combined)
+        
+        hidden_states_out_list: list[torch.Tensor] = []
+
+        for i in range(intra_layer_micro_batch):
+            post_combined = dispatcher.combine_postprocess(
+                pre_dispatched=pre_dispatched_list[i],
+                dispatched=dispatched_list[i],
+                post_dispatched=post_dispatched_list[i],
+                pre_combined=pre_combined_list[i],
+                combined=combined_list[i],
+                async_op=True,
+            )
+            hidden_states_out_list.append(post_combined["hidden_states"])
+        return hidden_states_out_list
+
+    
     def _dispatcher_call(
             self,
             dispatcher: DispacherInterface,
