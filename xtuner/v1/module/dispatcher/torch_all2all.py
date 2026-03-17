@@ -568,6 +568,7 @@ class TorchAll2AllDispatcher(
                 pre_dispatched["row_id_map"],
                 probs=dispatched["topk_weights"],
             )
+            hidden_states = hidden_states.bfloat16()
             backward_finished_event = None
         else:
             forward_previous_event = combined["forward_finished_event"]
@@ -580,6 +581,7 @@ class TorchAll2AllDispatcher(
                 pre_dispatched["row_id_map"],
                 probs=dispatched["topk_weights"],
             )
+            hidden_states = hidden_states.bfloat16()
             if hidden_states.grad_fn is not None:
                 hidden_states.grad_fn.register_hook(
                     get_backward_hook(

@@ -219,6 +219,11 @@ def cuda_token_permute_torch(
     return permuted_tokens, sorted_indices
 
 
+import os
+
+unpermute_torch_fp32 = os.environ.get("UNPERMUTE_TORCH_FP32", "0") == "1"
+
+
 def cuda_token_unpermute_torch(
     input_act: torch.Tensor,
     row_id_map: torch.Tensor,
@@ -245,4 +250,4 @@ def cuda_token_unpermute_torch(
         unpermuted_tokens = unpermuted_tokens * probs.unsqueeze(-1)
     unpermuted_tokens = unpermuted_tokens.sum(dim=1)
 
-    return unpermuted_tokens.to(input_act.dtype)
+    return unpermuted_tokens if unpermute_torch_fp32 else unpermuted_tokens.to(input_act.dtype)

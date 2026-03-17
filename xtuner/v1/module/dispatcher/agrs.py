@@ -89,6 +89,11 @@ def get_backward_hook(backward_finished_event: torch.cuda.Event, name: str | Non
     return _backward_hook
 
 
+import os
+
+fp32_rs = os.environ.get("FP32_RS", "0") == "1"
+
+
 class _AsyncDispatch(Function):
     @staticmethod
     def forward(
@@ -151,9 +156,13 @@ class _AsyncDispatch(Function):
             # ctx.comm_stream.wait_stream(compute_stream)
             if ctx.backward_previous_event is not None:
                 ctx.comm_stream.wait_event(ctx.backward_previous_event)
+            if fp32_rs:
+                grad_output = grad_output.float()
             combined_grad_output = reduce_scatter_tensor(
                 grad_output, reduceOp="sum", scatter_dim=0, group=ctx.process_group
             )
+            if fp32_rs:
+                combined_grad_output = combined_grad_output.bfloat16()
             grad_output.record_stream(ctx.comm_stream)
             combined_grad_output.record_stream(ctx.comm_stream)
             if ctx.backward_finished_event is not None:
@@ -176,14 +185,19 @@ class _AsyncCombine(Function):
         comm_stream: torch.cuda.Stream,
         process_group: dist.ProcessGroup,
     ):
+        ctx.input_dtype = hidden_states.dtype
         with torch.cuda.stream(comm_stream):
             comm_stream.wait_event(forward_previous_event)
 
+            if fp32_rs:
+                hidden_states = hidden_states.float()
             combined_hidden_states = reduce_scatter_tensor_autograd(
                 hidden_states, reduceOp="sum", scatter_dim=0, group=process_group
             )
             if isinstance(combined_hidden_states, AsyncCollectiveTensor):
                 combined_hidden_states = combined_hidden_states.wait()
+            if fp32_rs:
+                combined_hidden_states = combined_hidden_states.bfloat16()
 
             forward_finished_event.record(comm_stream)
 
@@ -206,6 +220,7 @@ class _AsyncCombine(Function):
             if ctx.backward_previous_event is not None:
                 ctx.comm_stream.wait_event(ctx.backward_previous_event)
             combined_grad_output = all_gather_tensor(grad_output, gather_dim=0, group=ctx.process_group)
+            combined_grad_output = combined_grad_output.to(ctx.input_dtype)
             grad_output.record_stream(ctx.comm_stream)
             combined_grad_output.record_stream(ctx.comm_stream)
 
@@ -468,12 +483,15 @@ class MoEAGRSDispatcher(
             forward_finished_event = None
             backward_previous_event = None
             hidden_states = pre_combined["hidden_states"]  # .float()
+            if fp32_rs:
+                hidden_states = hidden_states.float()
             combined_hidden_states = reduce_scatter_tensor_autograd(
                 hidden_states, reduceOp="sum", scatter_dim=0, group=self._process_group
             )
             if isinstance(combined_hidden_states, AsyncCollectiveTensor):
                 combined_hidden_states = combined_hidden_states.wait()
-            # combined_hidden_states = combined_hidden_states.bfloat16()
+            if fp32_rs:
+                combined_hidden_states = combined_hidden_states.bfloat16()
 
         return MoEAGRSCombineResult(
             hidden_states=combined_hidden_states,

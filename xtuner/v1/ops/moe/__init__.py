@@ -38,6 +38,9 @@ def get_group_gemm() -> GroupGemmProtocol:
         raise NotImplementedError
 
 
+use_torch_permute = os.environ.get("USE_TORCH_PERMUTE", "0") == "1"
+
+
 def get_token_permute() -> MoePermuteProtocol:
     from xtuner.v1.utils import get_device
 
@@ -47,8 +50,9 @@ def get_token_permute() -> MoePermuteProtocol:
 
     elif device == "cuda":
         from .cuda import cuda_token_permute
+        from .cuda.permute_unpermute import cuda_token_permute_torch
 
-        return cuda_token_permute
+        return cuda_token_permute_torch if use_torch_permute else cuda_token_permute
     elif device == "npu":
         from .npu import npu_token_permute
 
@@ -65,8 +69,9 @@ def get_token_unpermute() -> MoeUnpermuteProtocol:
         return cpu_unpermute
     elif device == "cuda":
         from .cuda import cuda_token_unpermute
+        from .cuda.permute_unpermute import cuda_token_unpermute_torch
 
-        return cuda_token_unpermute
+        return cuda_token_unpermute_torch if use_torch_permute else cuda_token_unpermute
     elif device == "npu":
         from .npu import npu_token_unpermute
 

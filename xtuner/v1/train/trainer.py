@@ -506,6 +506,11 @@ class Trainer:
         This method executes the main training loop, iterating through the dataset and performing training steps. It
         handles data loading, forward pass, backward pass, optimization, logging, and checkpointing.
         """
+        self.logger.info(
+            f"UNPERMUTE_TORCH_FP32={os.environ.get("UNPERMUTE_TORCH_FP32", "0")}, "
+            f"USE_TORCH_PERMUTE={os.environ.get("USE_TORCH_PERMUTE", "0")}, "
+            f"FP32_RS={os.environ.get("FP32_RS", "0")}"
+        )
         train_begin = time.time()
         time_before_get_data = time.time()
         for data_batch in self._data_iter():
